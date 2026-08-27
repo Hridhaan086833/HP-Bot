@@ -1,4 +1,5 @@
 import os
+import io
 import re
 import sqlite3
 import ast
@@ -7,7 +8,7 @@ import asyncio
 import random
 import string
 from urllib.parse import urlparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
 import discord  # type: ignore[import-not-found]
@@ -27,8 +28,22 @@ except ImportError:
 try:
 	from dotenv import load_dotenv  # type: ignore[import-not-found]
 except ImportError:
-	def load_dotenv(*args, **kwargs):
-		return False
+	def load_dotenv(dotenv_path=None, override=False, *args, **kwargs):
+		path = dotenv_path or ".env"
+		try:
+			with open(path, encoding="utf-8") as env_file:
+				for raw_line in env_file:
+					line = raw_line.strip()
+					if not line or line.startswith("#") or "=" not in line:
+						continue
+					key, value = line.split("=", 1)
+					key = key.strip()
+					value = value.strip().strip("'\"")
+					if key and (override or key not in os.environ):
+						os.environ[key] = value
+		except OSError:
+			return False
+		return True
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=False)
 
@@ -58,6 +73,7 @@ XP_PER_MESSAGE = max(1, env_int("XP_PER_MESSAGE") or 10)
 DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ticket_bot.sqlite3")
 MEDIA_LINK_HOSTS = {"youtube.com", "youtu.be", "imgur.com", "i.imgur.com", "tenor.com", "media.tenor.com"}
 GAME_COMMANDS = {"tic-tac-toe", "rps", "roulette", "trivia", "guess", "hangman", "connect-four", "wordle", "slot", "coinflip", "roll", "blackjack", "unscramble", "emoji-quiz", "truth-or-dare", "high-low", "minefield", "pokemon-guess", "math-race", "explore"}
+ANTINUKE_MODULES = ("channel_delete", "role_delete", "member_ban", "member_kick")
 
 CATEGORIES = {
 	"store": ("Store / Purchase Rank", "Minecraft IGN and proof or order links."),
@@ -72,6 +88,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+GIVEAWAY_TASKS: dict[int, asyncio.Task] = {}
 
 
 def db(query, args=(), fetch=False, many=False):
@@ -95,8 +112,29 @@ def init_db():
 		category TEXT NOT NULL,
 		channel_id INTEGER NOT NULL,
 		created_at TEXT NOT NULL,
+		claimed_by INTEGER,
+		claimed_at TEXT,
 		PRIMARY KEY (guild_id, user_id, category)
 	)""")
+	try:
+		db("ALTER TABLE tickets ADD COLUMN claimed_by INTEGER")
+	except sqlite3.OperationalError:
+		pass
+	try:
+		db("ALTER TABLE tickets ADD COLUMN claimed_at TEXT")
+	except sqlite3.OperationalError:
+		pass
+	db("CREATE TABLE IF NOT EXISTS ticket_log_config (guild_id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL)")
+	db("CREATE TABLE IF NOT EXISTS deletion_log_config (guild_id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL)")
+	db("CREATE TABLE IF NOT EXISTS deleted_messages (message_id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL, channel_id INTEGER NOT NULL, author_id INTEGER NOT NULL, author_name TEXT NOT NULL, content TEXT NOT NULL, attachments TEXT NOT NULL, deleted_at TEXT NOT NULL, reason TEXT NOT NULL)")
+	db("CREATE TABLE IF NOT EXISTS moderation_config (guild_id INTEGER PRIMARY KEY, role_id INTEGER NOT NULL)")
+	db("CREATE TABLE IF NOT EXISTS antinuke_config (guild_id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0, lockdown INTEGER NOT NULL DEFAULT 0, punishment TEXT NOT NULL DEFAULT 'quarantine', quarantine_role_id INTEGER, log_channel_id INTEGER, time_window INTEGER NOT NULL DEFAULT 10)")
+	db("CREATE TABLE IF NOT EXISTS antinuke_modules (guild_id INTEGER NOT NULL, module TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(guild_id, module))")
+	db("CREATE TABLE IF NOT EXISTS antinuke_limits (guild_id INTEGER NOT NULL, module TEXT NOT NULL, max_actions INTEGER NOT NULL DEFAULT 3, PRIMARY KEY(guild_id, module))")
+	db("CREATE TABLE IF NOT EXISTS antinuke_whitelist (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, PRIMARY KEY(guild_id, user_id))")
+	db("CREATE TABLE IF NOT EXISTS antinuke_events (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, module TEXT NOT NULL, created_at TEXT NOT NULL)")
+	db("CREATE TABLE IF NOT EXISTS giveaways (message_id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL, channel_id INTEGER NOT NULL, prize TEXT NOT NULL, winners INTEGER NOT NULL, end_at TEXT NOT NULL, created_by INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active')")
+	db("CREATE TABLE IF NOT EXISTS giveaway_entries (message_id INTEGER NOT NULL, user_id INTEGER NOT NULL, PRIMARY KEY(message_id, user_id))")
 	db("CREATE TABLE IF NOT EXISTS suggestions (message_id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL, author_id INTEGER NOT NULL, content TEXT NOT NULL, upvotes INTEGER NOT NULL DEFAULT 0, downvotes INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending')")
 	db("CREATE TABLE IF NOT EXISTS suggestion_votes (message_id INTEGER NOT NULL, user_id INTEGER NOT NULL, vote INTEGER NOT NULL, PRIMARY KEY(message_id, user_id))")
 	db("CREATE TABLE IF NOT EXISTS suggestion_config (guild_id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL)")
@@ -117,6 +155,34 @@ def init_db():
 def balance(user_id):
 	db("INSERT OR IGNORE INTO users(id) VALUES (?)", (user_id,))
 	return db("SELECT balance FROM users WHERE id=?", (user_id,), True)[0][0] # type: ignore
+
+
+ANTINUKE_MODULES = ("channel_delete", "role_delete", "member_ban", "member_kick")
+
+
+def ensure_antinuke(guild_id):
+	db("INSERT OR IGNORE INTO antinuke_config(guild_id) VALUES (?)", (guild_id,))
+	for module in ANTINUKE_MODULES:
+		db("INSERT OR IGNORE INTO antinuke_modules(guild_id, module) VALUES (?, ?)", (guild_id, module))
+		db("INSERT OR IGNORE INTO antinuke_limits(guild_id, module) VALUES (?, ?)", (guild_id, module))
+
+
+def get_antinuke_config(guild_id):
+	ensure_antinuke(guild_id)
+	rows = db("SELECT enabled, lockdown, punishment, quarantine_role_id, log_channel_id, time_window FROM antinuke_config WHERE guild_id=?", (guild_id,), True)
+	return rows[0] if rows else (0, 0, "quarantine", None, None, 10)
+
+
+async def set_antinuke_lockdown(guild: discord.Guild, locked: bool):
+	for channel in guild.text_channels:
+		try:
+			await channel.set_permissions(guild.default_role, send_messages=False if locked else None, reason="Anti-nuke lockdown")
+		except discord.HTTPException:
+			pass
+
+
+antinuke = app_commands.Group(name="antinuke", description="Configure anti-nuke protection")
+bot.tree.add_command(antinuke)
 
 
 async def game_channel_check(interaction: discord.Interaction):
@@ -164,7 +230,7 @@ async def create_ticket(interaction, category, minecraft_ign, details, links):
 	await interaction.response.defer(ephemeral=True)
 	row = db("SELECT channel_id FROM tickets WHERE guild_id=? AND user_id=? AND category=?", (guild.id, interaction.user.id, category), True)
 	if row:
-		channel = guild.get_channel(row[0])
+		channel = guild.get_channel(row[0][0])
 		if channel:
 			return await interaction.followup.send(f"You already have {channel.mention} for this category.", ephemeral=True)
 		db("DELETE FROM tickets WHERE guild_id=? AND user_id=? AND category=?", (guild.id, interaction.user.id, category))
@@ -176,21 +242,74 @@ async def create_ticket(interaction, category, minecraft_ign, details, links):
 	if SUPPORT_ROLE_ID and (role := guild.get_role(SUPPORT_ROLE_ID)):
 		overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 	category_channel = guild.get_channel(TICKET_CATEGORY_ID) if TICKET_CATEGORY_ID else None
-	channel = None
+	channel: Optional[discord.TextChannel] = None
 	try:
 		channel = await guild.create_text_channel(ticket_name(interaction.user, category), category=category_channel if isinstance(category_channel, discord.CategoryChannel) else None, overwrites=overwrites, reason="Ticket created")
-		db("INSERT INTO tickets VALUES (?, ?, ?, ?, ?)", (guild.id, interaction.user.id, category, channel.id, datetime.now(timezone.utc).isoformat()))
+		db("INSERT INTO tickets(guild_id, user_id, category, channel_id, created_at) VALUES (?, ?, ?, ?, ?)", (guild.id, interaction.user.id, category, channel.id, datetime.now(timezone.utc).isoformat())) # type: ignore
 		embed = discord.Embed(title=f"{CATEGORIES[category][0]} ticket", color=discord.Color.green())
 		embed.add_field(name="Minecraft IGN", value=minecraft_ign or "Not provided", inline=True)
 		embed.add_field(name="Details", value=details, inline=False)
 		if links:
 			embed.add_field(name="Proof / links", value=links, inline=False)
-		await channel.send(f"{interaction.user.mention} {f'<@&{SUPPORT_ROLE_ID}>' if SUPPORT_ROLE_ID else ''}", embed=embed, view=CloseTicketView())
-		await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True)
+		await channel.send(f"{interaction.user.mention} {f'<@&{SUPPORT_ROLE_ID}>' if SUPPORT_ROLE_ID else ''}", embed=embed, view=CloseTicketView()) # type: ignore
+		await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True) # type: ignore
 	except (discord.HTTPException, sqlite3.Error):
 		if channel:
 			await channel.delete(reason="Ticket setup failed")
 		await interaction.followup.send("I could not create that ticket. Check my channel permissions and try again.", ephemeral=True)
+
+async def log_ticket(channel: discord.TextChannel, closed_by: discord.abc.User):
+	if channel.guild is None:
+		return
+	log_row = db("SELECT channel_id FROM ticket_log_config WHERE guild_id=?", (channel.guild.id,), True)
+	ticket_row = db("SELECT user_id, category, created_at, claimed_by, claimed_at FROM tickets WHERE channel_id=?", (channel.id,), True)
+	if not log_row or not ticket_row:
+		return
+	log_channel = channel.guild.get_channel(log_row[0][0])
+	if not isinstance(log_channel, discord.TextChannel):
+		return
+	creator_id, category, created_at, claimed_by, claimed_at = ticket_row[0]
+	creator = channel.guild.get_member(creator_id)
+	creator_display = creator.mention if creator else f"<@{creator_id}>"
+	claimant = channel.guild.get_member(claimed_by) if claimed_by else None
+	claimant_display = claimant.mention if claimant else (f"<@{claimed_by}>" if claimed_by else "Not claimed")
+	lines = [f"Ticket transcript: #{channel.name}", f"Created by: {creator_display} ({creator_id})", f"Category: {category}", f"Closed by: {closed_by} ({closed_by.id})", ""]
+	try:
+		first_message = None
+		async for message in channel.history(limit=None, oldest_first=True):
+			if first_message is None:
+				first_message = message
+			content = message.content or "[no text]"
+			attachments = " ".join(attachment.url for attachment in message.attachments)
+			if attachments:
+				content = f"{content} Attachments: {attachments}"
+			lines.append(f"[{message.created_at.isoformat()}] {message.author} ({message.author.id}): {content}")
+		transcript = "\n".join(lines)
+		if len(transcript.encode("utf-8")) > 7_000_000:
+			transcript = transcript.encode("utf-8")[:7_000_000].decode("utf-8", errors="ignore") + "\n[Transcript truncated]"
+		file = discord.File(io.BytesIO(transcript.encode("utf-8")), filename=f"{channel.name}-transcript.txt")
+		details = "Not provided"
+		minecraft_ign = "Not provided"
+		if first_message and first_message.embeds:
+			for field in first_message.embeds[0].fields:
+				if field.name == "Details":
+					details = field.value
+				elif field.name == "Minecraft IGN":
+					minecraft_ign = field.value
+		embed = discord.Embed(title="Ticket closed", description=f"Ticket **#{channel.name}** has been closed and archived.", color=discord.Color.red())
+		embed.add_field(name="Created by", value=f"{creator_display}\nID: `{creator_id}`", inline=True)
+		embed.add_field(name="Category", value=category.replace("_", " ").title(), inline=True)
+		embed.add_field(name="Minecraft IGN", value=minecraft_ign, inline=True)
+		embed.add_field(name="Reason / Details", value=details[:1024], inline=False) # type: ignore
+		embed.add_field(name="Claimed by", value=claimant_display, inline=True)
+		embed.add_field(name="Claimed at", value=claimed_at or "Not claimed", inline=True)
+		embed.add_field(name="Closed by", value=f"{closed_by.mention}\nID: `{closed_by.id}`", inline=True)
+		embed.add_field(name="Created at", value=created_at, inline=True)
+		embed.add_field(name="Closed at", value=datetime.now(timezone.utc).isoformat(), inline=True)
+		embed.set_footer(text="Full ticket conversation attached as a transcript")
+		await log_channel.send(embed=embed, file=file)
+	except (discord.HTTPException, discord.Forbidden) as error:
+		print(f"Ticket log failed for {channel.name}: {error!r}")
 
 
 class TicketView(discord.ui.View):
@@ -364,18 +483,97 @@ class RoleView(discord.ui.View):
 		await interaction.response.send_message(message, ephemeral=True)
 
 
+class ModerationRoleView(discord.ui.View):
+	def __init__(self, role_id: int):
+		super().__init__(timeout=None)
+		self.role_id = role_id
+		self.selected_member_id: Optional[int] = None
+		select = discord.ui.UserSelect(placeholder="Select a member to manage...", custom_id=f"moderation:member:{role_id}", min_values=1, max_values=1)
+		select.callback = self.select_member
+		self.add_item(select)
+
+	async def interaction_check(self, interaction: discord.Interaction):
+		if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+			await interaction.response.send_message("Only administrators can manage this moderation role.", ephemeral=True)
+			return False
+		return True
+
+	async def select_member(self, interaction: discord.Interaction):
+		values = interaction.data.get("values", []) if interaction.data else []
+		self.selected_member_id = int(values[0]) if values else None
+		guild = interaction.guild
+		member = guild.get_member(self.selected_member_id) if guild and self.selected_member_id else None
+		if member is None:
+			return await interaction.response.send_message("That member is unavailable.", ephemeral=True)
+		await interaction.response.send_message(f"Selected {member.mention}. Choose Grant or Revoke.", ephemeral=True)
+
+	async def update_role(self, interaction: discord.Interaction, add: bool):
+		if self.selected_member_id is None or interaction.guild is None:
+			return await interaction.response.send_message("Select a member first.", ephemeral=True)
+		member = interaction.guild.get_member(self.selected_member_id)
+		role = interaction.guild.get_role(self.role_id)
+		if member is None or role is None:
+			return await interaction.response.send_message("The member or moderation role is unavailable.", ephemeral=True)
+		bot_member = interaction.guild.me
+		if bot_member is None or member == bot_member or role >= bot_member.top_role:
+			return await interaction.response.send_message("That moderation role cannot be managed.", ephemeral=True)
+		try:
+			if add:
+				await member.add_roles(role, reason=f"Moderation role granted by {interaction.user}")
+				message = f"Granted {role.mention} to {member.mention}."
+			else:
+				await member.remove_roles(role, reason=f"Moderation role revoked by {interaction.user}")
+				message = f"Revoked {role.mention} from {member.mention}."
+		except discord.HTTPException:
+			return await interaction.response.send_message("I could not update that member's role.", ephemeral=True)
+		await interaction.response.send_message(message, ephemeral=True)
+
+	@discord.ui.button(label="Grant", style=discord.ButtonStyle.green, custom_id="moderation:grant")
+	async def grant(self, interaction: discord.Interaction, button: discord.ui.Button):
+		await self.update_role(interaction, True)
+
+	@discord.ui.button(label="Revoke", style=discord.ButtonStyle.red, custom_id="moderation:revoke")
+	async def revoke(self, interaction: discord.Interaction, button: discord.ui.Button):
+		await self.update_role(interaction, False)
+
+
 class CloseTicketView(discord.ui.View):
 	def __init__(self):
 		super().__init__(timeout=None)
 
+	@discord.ui.button(label="Claim Ticket", emoji="🙋", style=discord.ButtonStyle.blurple, custom_id="ticket:claim")
+	async def claim_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+		if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+			return await interaction.response.send_message("Only server staff can claim tickets.", ephemeral=True)
+		support_role = interaction.guild.get_role(SUPPORT_ROLE_ID) if SUPPORT_ROLE_ID else None
+		is_staff = interaction.user.guild_permissions.manage_guild or (support_role is not None and support_role in interaction.user.roles)
+		if not is_staff:
+			return await interaction.response.send_message("Only ticket staff can claim this ticket.", ephemeral=True)
+		channel = interaction.channel
+		if not isinstance(channel, discord.TextChannel) or not channel.name.startswith("ticket-"):
+			return await interaction.response.send_message("This is not a ticket channel.", ephemeral=True)
+		claimed_at = datetime.now(timezone.utc).isoformat()
+		updated = db("UPDATE tickets SET claimed_by=?, claimed_at=? WHERE channel_id=? AND claimed_by IS NULL RETURNING claimed_by", (interaction.user.id, claimed_at, channel.id), fetch=True)
+		if not updated:
+			row = db("SELECT claimed_by FROM tickets WHERE channel_id=?", (channel.id,), True)
+			claimant = interaction.guild.get_member(row[0][0]) if row and row[0][0] else None
+			name = claimant.mention if claimant else "another staff member"
+			return await interaction.response.send_message(f"This ticket has already been claimed by {name}.", ephemeral=True)
+		embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed(title="Ticket") # type: ignore
+		embed.add_field(name="Claimed by", value=f"{interaction.user.mention}\n<t:{int(datetime.fromisoformat(claimed_at).timestamp())}:R>", inline=True)
+		await interaction.message.edit(embed=embed, view=self) # type: ignore
+		await interaction.response.send_message(f"{interaction.user.mention} claimed this ticket and will handle the response.")
+
 	@discord.ui.button(label="Close Ticket", emoji="🔒", style=discord.ButtonStyle.red, custom_id="ticket:close")
 	async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-		if not interaction.channel or not interaction.channel.name.startswith("ticket-"): # type: ignore
+		channel = interaction.channel
+		if not isinstance(channel, discord.TextChannel) or not channel.name.startswith("ticket-"):
 			return await interaction.response.send_message("This is not a ticket channel.", ephemeral=True)
-		db("DELETE FROM tickets WHERE channel_id=?", (interaction.channel.id,))
+		await log_ticket(channel, interaction.user)
+		db("DELETE FROM tickets WHERE channel_id=?", (channel.id,))
 		await interaction.response.send_message("Closing ticket in 5 seconds...")
 		await asyncio.sleep(5)
-		await interaction.channel.delete(reason=f"Closed by {interaction.user}") # type: ignore
+		await channel.delete(reason=f"Closed by {interaction.user}")
 
 
 class ShopView(discord.ui.View):
@@ -387,6 +585,76 @@ class ShopView(discord.ui.View):
 		await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+class GiveawayView(discord.ui.View):
+	def __init__(self):
+		super().__init__(timeout=None)
+
+	@discord.ui.button(label="Enter Giveaway", emoji="🎉", style=discord.ButtonStyle.green, custom_id="giveaway:enter")
+	async def enter(self, interaction: discord.Interaction, button: discord.ui.Button):
+		if interaction.guild is None or interaction.message is None:
+			return await interaction.response.send_message("Giveaways can only be entered in a server.", ephemeral=True)
+		row = db("SELECT status, end_at FROM giveaways WHERE message_id=?", (interaction.message.id,), True)
+		if not row or row[0][0] != "active":
+			return await interaction.response.send_message("This giveaway has ended.", ephemeral=True)
+		if datetime.fromisoformat(row[0][1]) <= datetime.now(timezone.utc):
+			await finish_giveaway(interaction.message.id)
+			return await interaction.response.send_message("This giveaway has ended.", ephemeral=True)
+		added = db("INSERT OR IGNORE INTO giveaway_entries(message_id, user_id) VALUES (?, ?) RETURNING user_id", (interaction.message.id, interaction.user.id), fetch=True)
+		if not added:
+			return await interaction.response.send_message("You are already entered in this giveaway.", ephemeral=True)
+		count_row = db("SELECT COUNT(*) FROM giveaway_entries WHERE message_id=?", (interaction.message.id,), True)
+		count = count_row[0][0] if count_row else 0
+		embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed(title="Giveaway")
+		for field in embed.fields:
+			if field.name == "Entries":
+				embed.set_field_at(embed.fields.index(field), name="Entries", value=f"{count:,}", inline=True)
+				break
+		await interaction.message.edit(embed=embed)
+		await interaction.response.send_message("You are entered. Good luck!", ephemeral=True)
+
+
+async def finish_giveaway(message_id):
+	row = db("SELECT guild_id, channel_id, prize, winners, created_by, status FROM giveaways WHERE message_id=?", (message_id,), True)
+	if not row or row[0][5] != "active":
+		return
+	guild_id, channel_id, prize, winner_count, created_by, _ = row[0]
+	entries = db("SELECT user_id FROM giveaway_entries WHERE message_id=?", (message_id,), True) or []
+	winner_ids = [entry[0] for entry in random.sample(entries, min(winner_count, len(entries)))] if entries else []
+	db("UPDATE giveaways SET status='ended' WHERE message_id=?", (message_id,))
+	guild = bot.get_guild(guild_id)
+	channel = guild.get_channel(channel_id) if guild else None
+	if not isinstance(channel, discord.TextChannel):
+		return
+	try:
+		message = await channel.fetch_message(message_id)
+		mentions = ", ".join(f"<@{user_id}>" for user_id in winner_ids) or "No valid entries"
+		creator = guild.get_member(created_by) if guild else None
+		creator_display = creator.mention if creator else f"<@{created_by}>"
+		embed = discord.Embed(
+			title="🎉 Giveaway Complete",
+			description=f"## {prize}\n\n{'Congratulations to the winner(s)!' if winner_ids else 'There were no eligible entries.'}",
+			color=discord.Color.green() if winner_ids else discord.Color.dark_grey(),
+			timestamp=datetime.now(timezone.utc),
+		)
+		embed.add_field(name="Winner(s)", value=mentions, inline=False)
+		embed.add_field(name="Prize", value=prize, inline=True)
+		embed.add_field(name="Total entries", value=f"{len(entries):,}", inline=True)
+		embed.add_field(name="Created by", value=creator_display, inline=True)
+		embed.set_footer(text="Giveaway ended")
+		await message.edit(embed=embed, view=None)
+		await channel.send(f"🎉 **Giveaway complete!** {mentions} won **{prize}**.")
+	except (discord.HTTPException, discord.NotFound):
+		pass
+
+
+def schedule_giveaway(message_id, end_at):
+	if message_id in GIVEAWAY_TASKS and not GIVEAWAY_TASKS[message_id].done():
+		return
+	delay = max(0, (datetime.fromisoformat(end_at) - datetime.now(timezone.utc)).total_seconds())
+	GIVEAWAY_TASKS[message_id] = asyncio.create_task(asyncio.sleep(delay))
+	GIVEAWAY_TASKS[message_id].add_done_callback(lambda _: asyncio.create_task(finish_giveaway(message_id)))
+
+
 @bot.event
 async def on_ready():
 	init_db()
@@ -395,12 +663,20 @@ async def on_ready():
 		bot.add_view(CloseTicketView())
 		bot.add_view(SuggestionView())
 		bot.add_view(ConfessionView())
+		bot.add_view(GiveawayView())
+		for role_id, in (db("SELECT role_id FROM moderation_config", fetch=True) or []):
+			bot.add_view(ModerationRoleView(role_id))
 		if os.getenv("REACTION_ROLES"):
 			bot.add_view(RoleView())
 		bot._persistent_views_added = True # type: ignore
 	if not getattr(bot, "_commands_synced", False):
+		for guild in bot.guilds:
+			bot.tree.clear_commands(guild=guild)
+			await bot.tree.sync(guild=guild)
 		await bot.tree.sync()
 		bot._commands_synced = True # type: ignore
+	for message_id, end_at in (db("SELECT message_id, end_at FROM giveaways WHERE status='active'", fetch=True) or []):
+		schedule_giveaway(message_id, end_at)
 	print(f"Logged in as {bot.user}")
 
 
@@ -424,6 +700,199 @@ async def setup_ticket_error(interaction: discord.Interaction, error):
 		await interaction.response.send_message(message, ephemeral=True)
 
 
+@bot.tree.command(name="setup-ticket-log", description="Set the channel where closed ticket transcripts are stored")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(channel="Text channel for closed ticket transcripts")
+async def setup_ticket_log(interaction: discord.Interaction, channel: discord.TextChannel):
+	if interaction.guild is None:
+		return await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+	bot_member = interaction.guild.me
+	if bot_member is None:
+		return await interaction.response.send_message("I could not verify my permissions in that channel.", ephemeral=True)
+	permissions = channel.permissions_for(bot_member)
+	if not permissions.send_messages or not permissions.embed_links or not permissions.attach_files:
+		return await interaction.response.send_message("I need Send Messages, Embed Links, and Attach Files permission in that channel.", ephemeral=True)
+	db("INSERT INTO ticket_log_config(guild_id, channel_id) VALUES (?, ?) ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id", (interaction.guild.id, channel.id))
+	await interaction.response.send_message(f"Closed ticket transcripts will now be stored in {channel.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="setup-deletion-logs", description="Set the channel where deleted messages are archived")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(channel="Text channel for deleted-message logs")
+async def setup_deletion_logs(interaction: discord.Interaction, channel: discord.TextChannel):
+	if interaction.guild is None or interaction.guild.me is None:
+		return await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+	permissions = channel.permissions_for(interaction.guild.me)
+	if not permissions.send_messages or not permissions.embed_links:
+		return await interaction.response.send_message("I need Send Messages and Embed Links permission in that channel.", ephemeral=True)
+	db("INSERT INTO deletion_log_config(guild_id, channel_id) VALUES (?, ?) ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id", (interaction.guild.id, channel.id))
+	await interaction.response.send_message(f"Deleted-message logs will now be sent to {channel.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="deleted-logs", description="View recently deleted messages")
+@app_commands.checks.has_permissions(manage_messages=True)
+@app_commands.describe(limit="Number of recent deleted messages to display")
+async def deleted_logs(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 10] = 10):
+	if interaction.guild is None:
+		return await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+	rows = db("SELECT channel_id, author_id, author_name, content, attachments, deleted_at, reason FROM deleted_messages WHERE guild_id=? ORDER BY deleted_at DESC LIMIT ?", (interaction.guild.id, limit), True) or []
+	if not rows:
+		return await interaction.response.send_message("No deleted-message logs are available.", ephemeral=True)
+	embed = discord.Embed(title="🗑️ Deleted Message Logs", description=f"Showing the {len(rows)} most recent deleted messages.", color=discord.Color.red())
+	for index, (channel_id, author_id, author_name, content, attachments, deleted_at, reason) in enumerate(rows, 1):
+		channel = interaction.guild.get_channel(channel_id)
+		location = channel.mention if channel else f"<#{channel_id}>"
+		value = f"**Author:** {author_name} (<@{author_id}>)\n**Channel:** {location}\n**Reason:** {reason}\n**Deleted:** {deleted_at}\n**Content:** {(content or '[no text]')[:700]}"
+		if attachments != "None":
+			value += f"\n**Attachments:** {attachments[:300]}"
+		embed.add_field(name=f"{index}. Message `{author_id}`", value=value[:1024], inline=False)
+	await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@antinuke.command(name="enable", description="Enable anti-nuke protection")
+@app_commands.checks.has_permissions(administrator=True)
+async def antinuke_enable(interaction: discord.Interaction):
+	ensure_antinuke(interaction.guild.id) # type: ignore
+	db("UPDATE antinuke_config SET enabled=1 WHERE guild_id=?", (interaction.guild.id,)) # type: ignore
+	await interaction.response.send_message("Anti-nuke protection enabled.", ephemeral=True)
+
+
+@antinuke.command(name="disable", description="Disable anti-nuke protection")
+@app_commands.checks.has_permissions(administrator=True)
+async def antinuke_disable(interaction: discord.Interaction):
+	ensure_antinuke(interaction.guild.id) # type: ignore
+	db("UPDATE antinuke_config SET enabled=0 WHERE guild_id=?", (interaction.guild.id,)) # type: ignore
+	await interaction.response.send_message("Anti-nuke protection disabled.", ephemeral=True)
+
+
+@antinuke.command(name="guard", description="Enable or disable a protection module")
+@app_commands.checks.has_permissions(administrator=True)
+async def antinuke_guard(interaction: discord.Interaction, module: Literal["channel_delete", "role_delete", "member_ban", "member_kick"], status: Literal["enable", "disable"]):
+	ensure_antinuke(interaction.guild.id) # type: ignore
+	db("UPDATE antinuke_modules SET enabled=? WHERE guild_id=? AND module=?", (status == "enable", interaction.guild.id, module)) # type: ignore
+	await interaction.response.send_message(f"Guard `{module}` {status}d.", ephemeral=True)
+
+
+@antinuke.command(name="limits", description="Set a module action limit")
+@app_commands.checks.has_permissions(administrator=True)
+async def antinuke_limits(interaction: discord.Interaction, module: Literal["channel_delete", "role_delete", "member_ban", "member_kick"], limit: app_commands.Range[int, 1, 100]):
+	ensure_antinuke(interaction.guild.id) # type: ignore
+	db("UPDATE antinuke_limits SET max_actions=? WHERE guild_id=? AND module=?", (limit, interaction.guild.id, module)) # type: ignore
+	await interaction.response.send_message(f"Limit for `{module}` set to {limit} actions.", ephemeral=True)
+
+
+@antinuke.command(name="lockdown", description="Enable or disable lockdown mode")
+@app_commands.checks.has_permissions(administrator=True)
+async def antinuke_lockdown(interaction: discord.Interaction, status: Literal["enable", "disable"]):
+	ensure_antinuke(interaction.guild.id) # type: ignore
+	db("UPDATE antinuke_config SET lockdown=? WHERE guild_id=?", (status == "enable", interaction.guild.id)) # type: ignore
+	await set_antinuke_lockdown(interaction.guild, status == "enable") # type: ignore
+	await interaction.response.send_message(f"Anti-nuke lockdown {status}d.", ephemeral=True)
+
+
+@antinuke.command(name="punishment", description="Choose the response to a detected attack")
+@app_commands.checks.has_permissions(administrator=True)
+async def antinuke_punishment(interaction: discord.Interaction, action: Literal["ban", "kick", "quarantine", "none"]):
+	ensure_antinuke(interaction.guild.id) # type: ignore
+	db("UPDATE antinuke_config SET punishment=? WHERE guild_id=?", (action, interaction.guild.id)) # type: ignore
+	await interaction.response.send_message(f"Anti-nuke punishment set to `{action}`.", ephemeral=True)
+
+
+@antinuke.command(name="quarantinerole", description="Set the quarantine role")
+@app_commands.checks.has_permissions(administrator=True)
+async def antinuke_quarantine_role(interaction: discord.Interaction, role: discord.Role):
+	if interaction.guild is None or interaction.guild.me is None or role >= interaction.guild.me.top_role:
+		return await interaction.response.send_message("That role cannot be managed by the bot.", ephemeral=True)
+	ensure_antinuke(interaction.guild.id)
+	db("UPDATE antinuke_config SET quarantine_role_id=? WHERE guild_id=?", (role.id, interaction.guild.id))
+	await interaction.response.send_message(f"Quarantine role set to {role.mention}.", ephemeral=True)
+
+
+@antinuke.command(name="recover", description="Clear events and disable lockdown")
+@app_commands.checks.has_permissions(administrator=True)
+async def antinuke_recover(interaction: discord.Interaction):
+	ensure_antinuke(interaction.guild.id) # type: ignore
+	db("UPDATE antinuke_config SET lockdown=0 WHERE guild_id=?", (interaction.guild.id,)) # type: ignore
+	db("DELETE FROM antinuke_events WHERE guild_id=?", (interaction.guild.id,)) # type: ignore
+	await set_antinuke_lockdown(interaction.guild, False) # type: ignore
+	await interaction.response.send_message("Anti-nuke recovery complete; lockdown disabled.", ephemeral=True)
+
+
+@antinuke.command(name="reset", description="Reset anti-nuke settings")
+@app_commands.checks.has_permissions(administrator=True)
+async def antinuke_reset(interaction: discord.Interaction):
+	ensure_antinuke(interaction.guild.id) # type: ignore
+	db("UPDATE antinuke_config SET enabled=0, lockdown=0, punishment='quarantine', quarantine_role_id=NULL, log_channel_id=NULL, time_window=10 WHERE guild_id=?", (interaction.guild.id,)) # type: ignore
+	db("UPDATE antinuke_modules SET enabled=1 WHERE guild_id=?", (interaction.guild.id,)) # type: ignore
+	db("UPDATE antinuke_limits SET max_actions=3 WHERE guild_id=?", (interaction.guild.id,)) # type: ignore
+	db("DELETE FROM antinuke_whitelist WHERE guild_id=?", (interaction.guild.id,)) # type: ignore
+	await interaction.response.send_message("Anti-nuke settings reset and disabled.", ephemeral=True)
+
+
+@antinuke.command(name="status", description="Show anti-nuke status")
+@app_commands.checks.has_permissions(administrator=True)
+async def antinuke_status(interaction: discord.Interaction):
+	config = get_antinuke_config(interaction.guild.id) # type: ignore
+	modules = db("SELECT module, enabled FROM antinuke_modules WHERE guild_id=?", (interaction.guild.id,), True) or [] # type: ignore
+	limits = db("SELECT module, max_actions FROM antinuke_limits WHERE guild_id=?", (interaction.guild.id,), True) or [] # type: ignore
+	limit_map = dict(limits)
+	module_text = "\n".join(f"`{module}`: {'on' if enabled else 'off'} | limit {limit_map.get(module, 3)}" for module, enabled in modules) or "No modules configured"
+	embed = discord.Embed(title="Anti-nuke status", color=discord.Color.green() if config[0] else discord.Color.red())
+	embed.add_field(name="Protection", value="Enabled" if config[0] else "Disabled", inline=True)
+	embed.add_field(name="Lockdown", value="Enabled" if config[1] else "Disabled", inline=True)
+	embed.add_field(name="Punishment", value=config[2], inline=True)
+	embed.add_field(name="Time window", value=f"{config[5]} seconds", inline=True)
+	embed.add_field(name="Modules", value=module_text, inline=False)
+	await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@antinuke.command(name="timewindow", description="Set the detection time window")
+@app_commands.checks.has_permissions(administrator=True)
+async def antinuke_time_window(interaction: discord.Interaction, seconds: app_commands.Range[int, 1, 3600]):
+	ensure_antinuke(interaction.guild.id) # type: ignore
+	db("UPDATE antinuke_config SET time_window=? WHERE guild_id=?", (seconds, interaction.guild.id)) # type: ignore
+	await interaction.response.send_message(f"Anti-nuke time window set to {seconds} seconds.", ephemeral=True)
+
+
+@antinuke.command(name="whitelist", description="Add or remove a user from the whitelist")
+@app_commands.checks.has_permissions(administrator=True)
+async def antinuke_whitelist(interaction: discord.Interaction, member: discord.Member, action: Literal["add", "remove"]):
+	if action == "add":
+		db("INSERT OR IGNORE INTO antinuke_whitelist(guild_id, user_id) VALUES (?, ?)", (interaction.guild.id, member.id)) # type: ignore
+	else:
+		db("DELETE FROM antinuke_whitelist WHERE guild_id=? AND user_id=?", (interaction.guild.id, member.id)) # type: ignore
+	await interaction.response.send_message(f"{member.mention} {('added to' if action == 'add' else 'removed from')} the whitelist.", ephemeral=True)
+
+
+@antinuke.command(name="setlogs", description="Set the anti-nuke log channel")
+@app_commands.checks.has_permissions(administrator=True)
+async def antinuke_set_logs(interaction: discord.Interaction, channel: discord.TextChannel):
+	if interaction.guild is None or interaction.guild.me is None or not channel.permissions_for(interaction.guild.me).send_messages:
+		return await interaction.response.send_message("I cannot send messages in that channel.", ephemeral=True)
+	ensure_antinuke(interaction.guild.id)
+	db("UPDATE antinuke_config SET log_channel_id=? WHERE guild_id=?", (channel.id, interaction.guild.id))
+	await interaction.response.send_message(f"Anti-nuke logs will be sent to {channel.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="giveaway", description="Create a timed giveaway")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(prize="What the winner will receive", duration="Giveaway duration in minutes", winners="Number of winners")
+async def giveaway(interaction: discord.Interaction, prize: str, duration: app_commands.Range[int, 1, 10080], winners: app_commands.Range[int, 1, 20] = 1):
+	if interaction.guild is None:
+		return await interaction.response.send_message("Giveaways can only be created in a server.", ephemeral=True)
+	end_at = datetime.now(timezone.utc) + timedelta(minutes=duration)
+	embed = discord.Embed(title="🎉 Giveaway", description=f"## {prize}\n\nClick the button below to enter for a chance to win!", color=discord.Color.gold())
+	embed.add_field(name="Ends", value=f"<t:{int(end_at.timestamp())}:F>\n<t:{int(end_at.timestamp())}:R>", inline=True)
+	embed.add_field(name="Winners", value=f"{winners:,}", inline=True)
+	embed.add_field(name="Entries", value="0", inline=True)
+	embed.add_field(name="Hosted by", value=interaction.user.mention, inline=False)
+	embed.set_footer(text=f"Started by {interaction.user.display_name}")
+	await interaction.response.send_message(embed=embed, view=GiveawayView())
+	message = await interaction.original_response()
+	db("INSERT INTO giveaways(message_id, guild_id, channel_id, prize, winners, end_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)", (message.id, interaction.guild.id, message.channel.id, prize, winners, end_at.isoformat(), interaction.user.id))
+	schedule_giveaway(message.id, end_at.isoformat())
+
+
 @bot.tree.command(name="audit", description="Scan roles and bots for common security risks")
 @app_commands.checks.has_permissions(administrator=True)
 async def audit(interaction: discord.Interaction):
@@ -442,6 +911,102 @@ async def audit(interaction: discord.Interaction):
 	embed = discord.Embed(title="Server security audit", description=description, color=discord.Color.orange() if risks else discord.Color.green())
 	embed.set_footer(text="Review findings manually before changing permissions.")
 	await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+def moderation_target_allowed(interaction: discord.Interaction, target: discord.Member):
+	if interaction.guild is None or interaction.guild.me is None:
+		return False
+	return target != interaction.user and target != interaction.guild.me and target.top_role < interaction.guild.me.top_role
+
+
+@bot.tree.command(name="kick", description="Kick a member from the server")
+@app_commands.checks.has_permissions(kick_members=True)
+@app_commands.describe(member="Member to kick", reason="Reason for the kick")
+async def kick(interaction: discord.Interaction, member: discord.Member, reason: Optional[str] = None):
+	if not moderation_target_allowed(interaction, member):
+		return await interaction.response.send_message("You cannot moderate that member because of role hierarchy.", ephemeral=True)
+	try:
+		await member.kick(reason=reason or f"Kicked by {interaction.user}")
+	except discord.Forbidden:
+		return await interaction.response.send_message("I do not have permission to kick that member.", ephemeral=True)
+	await interaction.response.send_message(f"Kicked **{member}**. Reason: {reason or 'No reason provided.'}")
+
+
+@bot.tree.command(name="ban", description="Ban a member from the server")
+@app_commands.checks.has_permissions(ban_members=True)
+@app_commands.describe(member="Member to ban", reason="Reason for the ban", delete_days="Days of messages to delete")
+async def ban(interaction: discord.Interaction, member: discord.Member, reason: Optional[str] = None, delete_days: app_commands.Range[int, 0, 7] = 0):
+	if not moderation_target_allowed(interaction, member):
+		return await interaction.response.send_message("You cannot moderate that member because of role hierarchy.", ephemeral=True)
+	try:
+		await member.ban(reason=reason or f"Banned by {interaction.user}", delete_message_days=delete_days)
+	except discord.Forbidden:
+		return await interaction.response.send_message("I do not have permission to ban that member.", ephemeral=True)
+	await interaction.response.send_message(f"Banned **{member}**. Reason: {reason or 'No reason provided.'}")
+
+
+@bot.tree.command(name="mute", description="Timeout a member")
+@app_commands.checks.has_permissions(moderate_members=True)
+@app_commands.describe(member="Member to mute", duration="Timeout duration in minutes", reason="Reason for the mute")
+async def mute(interaction: discord.Interaction, member: discord.Member, duration: app_commands.Range[int, 1, 40320], reason: Optional[str] = None):
+	if not moderation_target_allowed(interaction, member):
+		return await interaction.response.send_message("You cannot moderate that member because of role hierarchy.", ephemeral=True)
+	try:
+		await member.timeout(timedelta(minutes=duration), reason=reason or f"Muted by {interaction.user}")
+	except discord.Forbidden:
+		return await interaction.response.send_message("I do not have permission to mute that member.", ephemeral=True)
+	await interaction.response.send_message(f"Muted **{member}** for **{duration} minutes**. Reason: {reason or 'No reason provided.'}")
+
+
+@bot.tree.command(name="unmute", description="Remove a member's timeout")
+@app_commands.checks.has_permissions(moderate_members=True)
+@app_commands.describe(member="Member to unmute", reason="Reason for removing the mute")
+async def unmute(interaction: discord.Interaction, member: discord.Member, reason: Optional[str] = None):
+	if not moderation_target_allowed(interaction, member):
+		return await interaction.response.send_message("You cannot moderate that member because of role hierarchy.", ephemeral=True)
+	try:
+		await member.timeout(None, reason=reason or f"Unmuted by {interaction.user}")
+	except discord.Forbidden:
+		return await interaction.response.send_message("I do not have permission to unmute that member.", ephemeral=True)
+	await interaction.response.send_message(f"Removed the timeout from **{member}**.")
+
+
+@bot.tree.command(name="unban", description="Unban a user by ID")
+@app_commands.checks.has_permissions(ban_members=True)
+@app_commands.describe(user_id="The banned user's Discord ID", reason="Reason for the unban")
+async def unban(interaction: discord.Interaction, user_id: str, reason: Optional[str] = None):
+	if interaction.guild is None:
+		return await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+	try:
+		user = await bot.fetch_user(int(user_id))
+		await interaction.guild.unban(user, reason=reason or f"Unbanned by {interaction.user}")
+	except (ValueError, discord.NotFound):
+		return await interaction.response.send_message("That user ID is invalid or the user is not banned.", ephemeral=True)
+	except discord.Forbidden:
+		return await interaction.response.send_message("I do not have permission to unban users.", ephemeral=True)
+	await interaction.response.send_message(f"Unbanned **{user}**.")
+
+
+@bot.tree.command(name="setup-moderation-role", description="Create and configure the moderation role panel")
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_moderation_role(interaction: discord.Interaction):
+	if interaction.guild is None:
+		return await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+	permissions = discord.Permissions(kick_members=True, ban_members=True, moderate_members=True, manage_messages=True)
+	config = db("SELECT role_id FROM moderation_config WHERE guild_id=?", (interaction.guild.id,), True)
+	role = interaction.guild.get_role(config[0][0]) if config else None
+	try:
+		if role is None:
+			role = await interaction.guild.create_role(name="Server Moderator", permissions=permissions, reason=f"Created by {interaction.user}")
+		else:
+			await role.edit(permissions=permissions, reason=f"Updated by {interaction.user}")
+	except discord.Forbidden:
+		return await interaction.response.send_message("I need Manage Roles permission to create or update the moderation role.", ephemeral=True)
+	db("INSERT INTO moderation_config(guild_id, role_id) VALUES (?, ?) ON CONFLICT(guild_id) DO UPDATE SET role_id=excluded.role_id", (interaction.guild.id, role.id))
+	view = ModerationRoleView(role.id)
+	embed = discord.Embed(title="🛡️ Moderation Role Manager", description=f"Select a member, then grant or revoke {role.mention}.\nThis role provides Kick Members, Ban Members, Moderate Members, and Manage Messages permissions.", color=discord.Color.orange())
+	embed.set_footer(text="Only administrators can use this panel.")
+	await interaction.response.send_message(embed=embed, view=view)
 
 
 @bot.tree.command(name="mediaonly", description="Enable or disable media-only enforcement")
@@ -597,6 +1162,29 @@ async def ask(interaction: discord.Interaction, question: str):
 		await interaction.followup.send("Gemini could not answer right now. Check the bot console and Gemini API key.")
 
 
+@bot.tree.command(name="help", description="Show the bot commands and how to use them")
+@app_commands.describe(category="Show one command category or everything")
+async def help_command(interaction: discord.Interaction, category: Literal["all", "support", "moderation", "economy", "games", "setup", "antinuke"] = "all"):
+	embed = discord.Embed(
+		title="Bot Help",
+		description="Use the commands below to get started. Choose a category to focus the list.",
+		color=discord.Color.blurple(),
+	)
+	sections = {
+		"support": ("Support", "`/suggest` Submit a suggestion\n`/confess` Send an anonymous confession\n`/ask question:<text>` Ask the AI assistant"),
+		"moderation": ("Moderation", "`/kick member:<member>` Kick a member\n`/ban member:<member>` Ban a member\n`/mute member:<member> duration:<minutes>` Timeout a member\n`/unmute member:<member>` Remove a timeout\n`/unban user_id:<id>` Unban a user\n`/deleted-logs limit:<number>` Review deleted messages\n`/setup-moderation-role` Create a moderator role and admin control panel"),
+		"antinuke": ("Anti-nuke (Administrators)", "`/antinuke enable|disable` Turn protection on or off\n`/antinuke guard module status` Toggle a guard module\n`/antinuke limits module limit` Set action limits\n`/antinuke lockdown status` Toggle lockdown\n`/antinuke punishment action` Set ban, kick, quarantine, or none\n`/antinuke quarantinerole role` Set the quarantine role\n`/antinuke recover` Clear events and unlock\n`/antinuke reset` Restore defaults\n`/antinuke status` View current settings\n`/antinuke timewindow seconds` Set detection window\n`/antinuke whitelist member action` Manage whitelist\n`/antinuke setlogs channel` Set the log channel"),
+		"economy": ("Coins and Shop", "`/leaderboard` See the top 10 coin holders\n`/shop` View useful rewards\n`/buy item:<name>` Spend coins on an item\n`/rank` View your activity XP and level"),
+		"games": ("Games", "`/tic-tac-toe opponent:<member>` Challenge a member\n`/rps opponent:<member>` Play Rock Paper Scissors\n`/pokemon-guess` Guess a Pokemon\n`/trivia` Answer a quiz\n`/slot bet:<amount>` Spin the slots\n`/blackjack` Play blackjack\n`/minefield` Clear the minefield\n`/coinflip choice:<heads|tails> bet:<amount>` Bet on a coin flip\n`/roll sides:<number>` Roll a die\n`/guess` Guess a number\n`/hangman` Start hangman\n`/wordle` Start Wordle\n`/unscramble` Solve a scrambled word\n`/emoji-quiz` Guess the movie\n`/math-race` Solve a math problem\n`/high-low guess:<high|low>` Guess the next card\n`/truth-or-dare` Get a prompt\n`/explore` Explore a dungeon"),
+		"setup": ("Server Setup (Administrators)", "`/giveaway prize:<text> duration:<minutes> winners:<number>` Create a giveaway\n`/setup-game-channel channel:<channel>` Restrict games to one channel\n`/setup-suggestion-channel channel:<channel>` Choose the suggestion channel\n`/setup-ticket-log channel:<channel>` Store closed ticket transcripts\n`/setup-deletion-logs channel:<channel>` Archive deleted messages\n`/setup-ticket` Post the ticket panel; staff can claim tickets with the Claim button\n`/setup-reaction-roles` Post the role panel\n`/mediaonly channel:<channel> status:<enable|disable>` Toggle media-only mode\n`/audit` Scan common server risks"),
+	}
+	selected_sections = sections.values() if category == "all" else [sections[category]]
+	for name, value in selected_sections:
+		embed.add_field(name=name, value=value, inline=False)
+	embed.set_footer(text="Games follow the server's configured game channel when one is set.")
+	await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def ticketpanel(ctx):
@@ -699,6 +1287,29 @@ def calculate_count(text):
 URL_PATTERN = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
 
 
+async def record_deleted_message(message: discord.Message, reason: str):
+	if message.guild is None or message.author.bot:
+		return
+	attachments = " ".join(attachment.url for attachment in message.attachments) or "None"
+	deleted_at = datetime.now(timezone.utc).isoformat()
+	db("INSERT OR IGNORE INTO deleted_messages(message_id, guild_id, channel_id, author_id, author_name, content, attachments, deleted_at, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (message.id, message.guild.id, message.channel.id, message.author.id, str(message.author), message.content or "[no text]", attachments, deleted_at, reason))
+	row = db("SELECT channel_id FROM deletion_log_config WHERE guild_id=?", (message.guild.id,), True)
+	log_channel = message.guild.get_channel(row[0][0]) if row else None
+	if not isinstance(log_channel, discord.TextChannel):
+		return
+	channel_name = message.channel.mention if isinstance(message.channel, discord.TextChannel) else f"channel {message.channel.id}"
+	embed = discord.Embed(title="🗑️ Message deleted", description=f"A message was deleted in {channel_name}.", color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
+	embed.add_field(name="Author", value=f"{message.author.mention}\n`{message.author.id}`", inline=True)
+	embed.add_field(name="Reason", value=reason, inline=True)
+	embed.add_field(name="Content", value=(message.content or "[no text]")[:1024], inline=False)
+	if attachments != "None":
+		embed.add_field(name="Attachments", value=attachments[:1024], inline=False)
+	try:
+		await log_channel.send(embed=embed)
+	except (discord.Forbidden, discord.HTTPException):
+		pass
+
+
 async def malicious_url(url):
 	host = (urlparse(url).hostname or "").lower().rstrip(".")
 	if not host or any(host == domain or host.endswith(f".{domain}") for domain in SAFE_DOMAINS):
@@ -721,6 +1332,7 @@ async def malicious_url(url):
 async def scan_message_links(message):
 	for url in URL_PATTERN.findall(message.content):
 		if await malicious_url(url):
+			await record_deleted_message(message, "Potentially unsafe link")
 			await message.delete()
 			try:
 				await message.channel.send(f"{message.author.mention}, that link was blocked as potentially unsafe.", delete_after=8)
@@ -783,11 +1395,12 @@ async def remove_empty_voice(channel):
 
 
 class TicTacToeView(discord.ui.View):
-	def __init__(self, first, second=None):
+	def __init__(self, first: discord.Member, second: discord.Member):
 		super().__init__(timeout=180)
 		self.players = [first, second]
 		self.board = [" "] * 9
 		self.turn = 0
+		self.message: Optional[discord.Message] = None
 		for index in range(9):
 			button = discord.ui.Button(label="·", style=discord.ButtonStyle.secondary, row=index // 3, custom_id=f"ttt:{index}")
 			button.callback = self.make_callback(index)
@@ -796,30 +1409,74 @@ class TicTacToeView(discord.ui.View):
 	def make_callback(self, index):
 		async def callback(interaction):
 			if interaction.user != self.players[self.turn]:
-				if self.players[1] is None:
-					self.players[1] = interaction.user
-				else:
-					return await interaction.response.send_message("Wait for your turn.", ephemeral=True)
+				return await interaction.response.send_message("Wait for your turn.", ephemeral=True)
 			if self.board[index] != " ":
 				return await interaction.response.send_message("That square is occupied.", ephemeral=True)
 			self.board[index] = "X" if self.turn == 0 else "O"
 			button = self.children[index]
 			button.label = self.board[index]
+			button.style = discord.ButtonStyle.success if self.board[index] == "X" else discord.ButtonStyle.danger
 			button.disabled = True
 			winner = self.winner()
 			if winner or " " not in self.board:
 				for item in self.children:
 					item.disabled = True # type: ignore
-				return await interaction.response.edit_message(content=winner or "Draw!", view=self)
+				if winner:
+					winner_member = self.players[0 if winner == "X" else 1]
+					loser_member = self.players[1 if winner == "X" else 0]
+					result = f"🏆 {winner_member.mention} wins Tic-Tac-Toe! {loser_member.mention}, better luck next time."
+				else:
+					result = f"🤝 Draw! {self.players[0].mention} and {self.players[1].mention} tied."
+				return await interaction.response.edit_message(content=result, view=self)
 			self.turn = 1 - self.turn
-			await interaction.response.edit_message(content=f"Turn: {self.players[self.turn].mention}", view=self)
+			await interaction.response.edit_message(content=f"🎮 {self.players[0].mention} (X) vs {self.players[1].mention} (O)\nTurn: {self.players[self.turn].mention}", view=self)
 		return callback
+
+	async def on_timeout(self):
+		for item in self.children:
+			item.disabled = True # type: ignore
+		if self.message:
+			await self.message.edit(content=f"⌛ Tic-Tac-Toe expired. {self.players[0].mention} and {self.players[1].mention}, start a new game to play again.", view=self)
 
 	def winner(self):
 		for line in ((0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6), (1, 4, 7), (2, 5, 8), (0, 4, 8), (2, 4, 6)):
 			if self.board[line[0]] != " " and len({self.board[i] for i in line}) == 1:
 				return f"{self.board[line[0]]} wins!"
 		return None
+
+
+class GameChallengeView(discord.ui.View):
+	def __init__(self, challenger, opponent, game):
+		super().__init__(timeout=60)
+		self.challenger = challenger
+		self.opponent = opponent
+		self.game = game
+
+	async def interaction_check(self, interaction: discord.Interaction):
+		if interaction.user != self.opponent:
+			await interaction.response.send_message("Only the challenged player can respond.", ephemeral=True)
+			return False
+		return True
+
+	@discord.ui.button(label="Accept", style=discord.ButtonStyle.green)
+	async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+		self.stop()
+		for item in self.children:
+			item.disabled = True # type: ignore
+		if self.game == "tic-tac-toe":
+			game_view = TicTacToeView(self.challenger, self.opponent)
+			await interaction.response.edit_message(content=f"🎮 {self.challenger.mention} (X) vs {self.opponent.mention} (O)\nTurn: {self.challenger.mention}", view=game_view)
+			game_view.message = await interaction.original_response()
+		else:
+			game_view = RPSView(self.challenger, self.opponent)
+			await interaction.response.edit_message(content=f"{self.opponent.mention} accepted! Choose your move.", view=game_view)
+
+	@discord.ui.button(label="Deny", style=discord.ButtonStyle.red)
+	async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+		self.stop()
+		for item in self.children:
+			item.disabled = True # type: ignore
+		await interaction.response.edit_message(content=f"{self.opponent.mention} declined the challenge from {self.challenger.mention}.", view=self)
 
 
 class RPSView(discord.ui.View):
@@ -848,7 +1505,9 @@ class RPSView(discord.ui.View):
 			winner = self.challenger if first != second and (first, second) in (("rock", "scissors"), ("scissors", "paper"), ("paper", "rock")) else self.opponent if first != second else None
 			for item in self.children:
 				item.disabled = True # type: ignore
-			await interaction.message.edit(content=f"{winner.mention + ' wins!' if winner else 'Draw!'}", view=self)
+			loser = self.opponent if winner == self.challenger else self.challenger if winner else None
+			result = f"🏆 {winner.mention} wins! {loser.mention}, better luck next time." if winner and loser else f"🤝 Draw! {self.challenger.mention} and {self.opponent.mention} tied."
+			await interaction.message.edit(content=result, view=self)
 
 class BlackjackView(discord.ui.View):
 	def __init__(self, interaction):
@@ -877,7 +1536,7 @@ class BlackjackView(discord.ui.View):
 		dealer = self.dealer
 		while dealer < 17:
 			dealer += random.randint(1, 11)
-		result = "You win!" if self.total() <= 21 and (dealer > 21 or self.total() > dealer) else "Dealer wins."
+		result = f"🏆 {self.user.mention} wins!" if self.total() <= 21 and (dealer > 21 or self.total() > dealer) else f"Dealer wins. {self.user.mention}, better luck next time."
 		await interaction.response.edit_message(content=f"Your {self.total()} vs dealer {dealer}: {result}", view=None)
 
 
@@ -899,10 +1558,14 @@ class MinefieldView(discord.ui.View):
 			if index in self.mines:
 				for item in self.children:
 					item.disabled = True # type: ignore
-				return await interaction.response.edit_message(content="💥 You hit a mine!", view=self)
+				return await interaction.response.edit_message(content=f"💥 {self.user.mention} hit a mine and lost!", view=self)
 			self.safe += 1
 			button.label = "💎"
-			await interaction.response.edit_message(content=f"Safe tiles: {self.safe}/12", view=self)
+			if self.safe == 12:
+				for item in self.children:
+					item.disabled = True # type: ignore
+				return await interaction.response.edit_message(content=f"🏆 {self.user.mention} cleared the minefield and won!", view=self)
+			await interaction.response.edit_message(content=f"{self.user.mention} safe tiles: {self.safe}/12", view=self)
 		return callback
 
 
@@ -913,34 +1576,41 @@ def change_balance(user_id, amount):
 
 @bot.tree.command(name="tic-tac-toe", description="Play interactive Tic-Tac-Toe")
 @app_commands.check(game_channel_check)
-async def tic_tac_toe(interaction: discord.Interaction, opponent: discord.Member = None): # type: ignore
+async def tic_tac_toe(interaction: discord.Interaction, opponent: Optional[discord.Member] = None):
 	if opponent is None or opponent == interaction.user or opponent.bot:
 		return await interaction.response.send_message("Choose another human player.", ephemeral=True)
-	await interaction.response.send_message(f"Turn: {interaction.user.mention}", view=TicTacToeView(interaction.user, opponent))
+	view = GameChallengeView(interaction.user, opponent, "tic-tac-toe")
+	await interaction.response.send_message(f"{opponent.mention}, {interaction.user.mention} has challenged you to Tic-Tac-Toe!", view=view)
 
 
 @bot.tree.command(name="rps", description="Play Rock Paper Scissors")
 @app_commands.check(game_channel_check)
-async def rps(interaction: discord.Interaction, opponent: discord.Member = None): # type: ignore
-	opponent = opponent or bot.user
-	if opponent == interaction.user:
+async def rps(interaction: discord.Interaction, opponent: Optional[discord.Member] = None):
+	if opponent is None:
+		if bot.user is None:
+			return await interaction.response.send_message("The bot is not ready yet.", ephemeral=True)
+		target: discord.abc.User = bot.user
+	else:
+		target = opponent
+	if target == interaction.user:
 		return await interaction.response.send_message("Choose another player.", ephemeral=True)
-	if opponent == bot.user:
-		return await interaction.response.send_message(f"Choose privately. The bot chose after you.", view=RPSView(interaction.user, bot.user))
-	await interaction.response.send_message(f"{interaction.user.mention} challenged {opponent.mention}.", view=RPSView(interaction.user, opponent))
+	if target == bot.user:
+		return await interaction.response.send_message("Choose privately. The bot chose after you.", view=RPSView(interaction.user, target))
+	view = GameChallengeView(interaction.user, target, "rps")
+	await interaction.response.send_message(f"{target.mention}, {interaction.user.mention} has challenged you to Rock Paper Scissors!", view=view)
 
 
 @bot.tree.command(name="roulette", description="Play a harmless Russian Roulette round")
 @app_commands.check(game_channel_check)
 async def roulette(interaction: discord.Interaction):
 	if random.randrange(6) == 0:
-		await interaction.response.send_message(f"💥 {interaction.user.mention} was eliminated and timed out for one minute.")
+		await interaction.response.send_message(f"💥 {interaction.user.mention} lost Russian Roulette and was timed out for one minute.")
 		try:
 			await interaction.user.timeout(datetime.now(timezone.utc) + __import__("datetime").timedelta(minutes=1), reason="Russian Roulette game") # type: ignore
 		except discord.HTTPException:
 			pass
 	else:
-		await interaction.response.send_message(f"Click... {interaction.user.mention} is safe.")
+		await interaction.response.send_message(f"✅ {interaction.user.mention} won Russian Roulette and is safe!")
 
 
 @bot.tree.command(name="trivia", description="Answer a random quiz question")
@@ -954,9 +1624,9 @@ async def trivia(interaction: discord.Interaction):
 		async def callback(button_interaction, selected=answer):
 			if selected == correct:
 				change_balance(button_interaction.user.id, 25)
-				result = f"Correct! {button_interaction.user.mention} earns 25 coins."
+				result = f"🏆 Correct! {button_interaction.user.mention} wins and earns 25 coins."
 			else:
-				result = f"Not quite. The answer was **{correct}**."
+				result = f"❌ {button_interaction.user.mention} lost this round. The answer was **{correct}**."
 			await button_interaction.response.edit_message(content=result, view=None)
 		button.callback = callback # type: ignore
 		view.add_item(button)
@@ -969,9 +1639,9 @@ async def timed_guess(interaction, title, answer):
 	try:
 		message = await bot.wait_for("message", timeout=30, check=lambda item: item.channel.id == interaction.channel.id and not item.author.bot and item.content.lower().strip() == answer.lower())
 		change_balance(message.author.id, 20)
-		await interaction.channel.send(f"{message.author.mention} wins 20 coins!")
+		await interaction.channel.send(f"🏆 {message.author.mention} wins 20 coins!")
 	except asyncio.TimeoutError:
-		await interaction.channel.send(f"Time's up. The answer was **{answer}**.")
+		await interaction.channel.send(f"⌛ Time's up. No winner this round. The answer was **{answer}**.")
 
 
 @bot.tree.command(name="guess", description="Guess a number from 1 to 100")
@@ -984,11 +1654,11 @@ async def guess(interaction: discord.Interaction):
 		try:
 			message = await bot.wait_for("message", timeout=max(0.1, end - asyncio.get_running_loop().time()), check=lambda item: item.channel.id == interaction.channel.id and item.content.isdigit()) # type: ignore
 		except asyncio.TimeoutError:
-			return await interaction.channel.send(f"Time's up. The number was {secret}.") # type: ignore
+			return await interaction.channel.send(f"⌛ Time's up. No winner this round. The number was {secret}.") # type: ignore
 		value = int(message.content)
 		if value == secret:
 			change_balance(message.author.id, 30)
-			return await interaction.channel.send(f"{message.author.mention} guessed it and wins 30 coins!") # type: ignore
+			return await interaction.channel.send(f"🏆 {message.author.mention} guessed it and wins 30 coins!") # type: ignore
 		await message.reply("Higher!" if value < secret else "Lower!", delete_after=5)
 
 
@@ -1032,7 +1702,7 @@ async def slot(interaction: discord.Interaction, bet: app_commands.Range[int, 1,
 	else:
 		status = "No match"
 		color = discord.Color.red()
-	embed = discord.Embed(title="🎰 Coin Slots", description=f"# | {result[0]} | {result[1]} | {result[2]} |\n\n**{status}**", color=color)
+	embed = discord.Embed(title="🎰 Coin Slots", description=f"{interaction.user.mention}\n# | {result[0]} | {result[1]} | {result[2]} |\n\n**{status}**", color=color)
 	embed.add_field(name="Bet", value=f"{bet:,} coins", inline=True)
 	embed.add_field(name="Payout", value=f"{win:,} coins", inline=True)
 	embed.add_field(name="Balance", value=f"{ending_balance:,} coins", inline=True)
@@ -1042,21 +1712,39 @@ async def slot(interaction: discord.Interaction, bet: app_commands.Range[int, 1,
 
 @bot.tree.command(name="coinflip", description="Flip a coin")
 @app_commands.check(game_channel_check)
-async def coinflip(interaction: discord.Interaction):
-	await interaction.response.send_message(f"🪙 {random.choice(('Heads', 'Tails'))}")
+@app_commands.describe(choice="Choose heads or tails", bet="Amount of coins to bet")
+async def coinflip(interaction: discord.Interaction, choice: Literal["heads", "tails"], bet: app_commands.Range[int, 1, 1000] = 10):
+	starting_balance = balance(interaction.user.id)
+	if starting_balance < bet:
+		return await interaction.response.send_message(f"You need {bet - starting_balance:,} more coins to place that bet.", ephemeral=True)
+	result = random.choice(("heads", "tails"))
+	won = choice == result
+	payout = bet * 2 if won else 0
+	change_balance(interaction.user.id, payout - bet)
+	ending_balance = starting_balance + payout - bet
+	embed = discord.Embed(
+		title="🪙 Coin Flip",
+		description=f"{interaction.user.mention}\nYour choice: **{choice.title()}**\nThe coin landed on: **{result.title()}**\n\n**{'You win!' if won else 'You lose!'}**",
+		color=discord.Color.green() if won else discord.Color.red(),
+	)
+	embed.add_field(name="Bet", value=f"{bet:,} coins", inline=True)
+	embed.add_field(name="Payout", value=f"{payout:,} coins", inline=True)
+	embed.add_field(name="Balance", value=f"{ending_balance:,} coins", inline=True)
+	embed.set_footer(text="Correct guesses pay 2x your bet")
+	await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="roll", description="Roll a die")
 @app_commands.check(game_channel_check)
 async def roll(interaction: discord.Interaction, sides: app_commands.Range[int, 2, 100] = 6):
-	await interaction.response.send_message(f"🎲 {random.randint(1, sides)} (d{sides})")
+	await interaction.response.send_message(f"🎲 {interaction.user.mention} rolled **{random.randint(1, sides)}** (d{sides}).")
 
 
 @bot.tree.command(name="blackjack", description="Play blackjack against the dealer")
 @app_commands.check(game_channel_check)
 async def blackjack(interaction: discord.Interaction):
 	view = BlackjackView(interaction)
-	await interaction.response.send_message(f"Your hand: {view.hand} ({view.total()})", view=view)
+	await interaction.response.send_message(f"{interaction.user.mention}'s hand: {view.hand} ({view.total()})", view=view)
 
 
 @bot.tree.command(name="unscramble", description="Solve a scrambled word")
@@ -1083,13 +1771,13 @@ async def truth_or_dare(interaction: discord.Interaction):
 async def high_low(interaction: discord.Interaction, guess: str):
 	first, second = random.randint(1, 13), random.randint(1, 13)
 	correct = (guess.lower() == "high" and second > first) or (guess.lower() == "low" and second < first)
-	await interaction.response.send_message(f"Card {first}, then {second}: {'Correct!' if correct else 'Wrong.'}")
+	await interaction.response.send_message(f"{interaction.user.mention}, card {first}, then {second}: {'🏆 Correct!' if correct else '❌ Wrong.'}")
 
 
 @bot.tree.command(name="minefield", description="Clear a clickable minefield")
 @app_commands.check(game_channel_check)
 async def minefield(interaction: discord.Interaction):
-	await interaction.response.send_message("Clear the field without hitting a mine.", view=MinefieldView(interaction.user))
+	await interaction.response.send_message(f"{interaction.user.mention}, clear the field without hitting a mine.", view=MinefieldView(interaction.user))
 
 
 @bot.tree.command(name="pokemon-guess", description="Guess the Pokemon from a hint")
@@ -1135,7 +1823,103 @@ async def explore(interaction: discord.Interaction):
 	monster = random.choice(["slime", "skeleton", "cave bat"])
 	reward = random.randint(20, 80)
 	change_balance(interaction.user.id, reward)
-	await interaction.response.send_message(f"You defeated a **{monster}** and found **{reward} coins**.")
+	await interaction.response.send_message(f"🏆 {interaction.user.mention} defeated a **{monster}** and found **{reward} coins**.")
+
+
+async def antinuke_guard_event(guild: discord.Guild, module: str, target_id: int):
+	config = get_antinuke_config(guild.id)
+	if not config[0]:
+		return
+	module_row = db("SELECT enabled FROM antinuke_modules WHERE guild_id=? AND module=?", (guild.id, module), True)
+	if not module_row or not module_row[0][0]:
+		return
+	audit_action = {
+		"channel_delete": discord.AuditLogAction.channel_delete,
+		"role_delete": discord.AuditLogAction.role_delete,
+		"member_ban": discord.AuditLogAction.ban,
+		"member_kick": discord.AuditLogAction.kick,
+	}[module]
+	actor = None
+	try:
+		async for entry in guild.audit_logs(limit=5, action=audit_action):
+			if entry.target and getattr(entry.target, "id", None) == target_id and (datetime.now(timezone.utc) - entry.created_at).total_seconds() <= 15:
+				actor = entry.user
+				break
+	except (discord.Forbidden, discord.HTTPException):
+		return
+	if actor is None or (bot.user is not None and actor.id == bot.user.id):
+		return
+	whitelisted = db("SELECT 1 FROM antinuke_whitelist WHERE guild_id=? AND user_id=?", (guild.id, actor.id), True)
+	if whitelisted:
+		return
+	now = datetime.now(timezone.utc)
+	db("INSERT INTO antinuke_events VALUES (?, ?, ?, ?)", (guild.id, actor.id, module, now.isoformat()))
+	window = max(1, int(config[5]))
+	cutoff = (now - timedelta(seconds=window)).isoformat()
+	db("DELETE FROM antinuke_events WHERE created_at < ?", (cutoff,))
+	limit_row = db("SELECT max_actions FROM antinuke_limits WHERE guild_id=? AND module=?", (guild.id, module), True)
+	limit = limit_row[0][0] if limit_row else 3
+	count_row = db("SELECT COUNT(*) FROM antinuke_events WHERE guild_id=? AND user_id=? AND module=? AND created_at>=?", (guild.id, actor.id, module, cutoff), True)
+	count = count_row[0][0] if count_row else 0
+	log_channel = guild.get_channel(config[4]) if config[4] is not None else None
+	if isinstance(log_channel, discord.TextChannel):
+		event_embed = discord.Embed(title="Anti-nuke event detected", description=f"A `{module}` action was detected.", color=discord.Color.orange())
+		event_embed.add_field(name="Actor", value=f"{actor.mention} (`{actor.id}`)", inline=True)
+		event_embed.add_field(name="Activity", value=f"{count}/{limit} actions in {window}s", inline=True)
+		event_embed.add_field(name="Status", value="Limit reached" if count >= limit else "Monitoring", inline=True)
+		try:
+			await log_channel.send(embed=event_embed)
+		except (discord.Forbidden, discord.HTTPException):
+			pass
+	if count < limit:
+		return
+	member = guild.get_member(actor.id)
+	if isinstance(member, discord.Member) and member != guild.owner and guild.me and member.top_role < guild.me.top_role:
+		try:
+			if config[2] == "ban":
+				await member.ban(reason=f"Anti-nuke: {module} limit exceeded")
+			elif config[2] == "kick":
+				await member.kick(reason=f"Anti-nuke: {module} limit exceeded")
+			elif config[2] == "quarantine" and config[3] is not None:
+				role = guild.get_role(config[3])
+				if role:
+					await member.add_roles(role, reason=f"Anti-nuke: {module} limit exceeded")
+		except discord.HTTPException:
+			pass
+	if config[1]:
+		await set_antinuke_lockdown(guild, True)
+	if config[4] is not None:
+		if isinstance(log_channel, discord.TextChannel):
+			embed = discord.Embed(title="Anti-nuke action", description=f"Detected repeated `{module}` actions.", color=discord.Color.red())
+			embed.add_field(name="Actor", value=f"{actor.mention} (`{actor.id}`)", inline=True)
+			embed.add_field(name="Count", value=f"{count} in {window}s", inline=True)
+			embed.add_field(name="Punishment", value=config[2], inline=True)
+			await log_channel.send(embed=embed)
+
+
+@bot.event
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
+	await antinuke_guard_event(channel.guild, "channel_delete", channel.id)
+
+
+@bot.event
+async def on_guild_role_delete(role: discord.Role):
+	await antinuke_guard_event(role.guild, "role_delete", role.id)
+
+
+@bot.event
+async def on_member_ban(guild: discord.Guild, user: discord.User):
+	await antinuke_guard_event(guild, "member_ban", user.id)
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+	await antinuke_guard_event(member.guild, "member_kick", member.id)
+
+
+@bot.event
+async def on_message_delete(message: discord.Message):
+	await record_deleted_message(message, "Deleted manually or by a moderator")
 
 
 @bot.event
@@ -1145,6 +1929,7 @@ async def on_message(message):
 	if await scan_message_links(message):
 		return
 	if media_only_enabled(message.guild.id, message.channel.id) and not has_media(message):
+		await record_deleted_message(message, "Media-only channel")
 		await message.delete()
 		await warn_media_only(message)
 		return
@@ -1153,6 +1938,7 @@ async def on_message(message):
 		last_number, last_user = row[0] if row else (0, None)
 		value = calculate_count(message.content.strip())
 		if value != last_number + 1 or last_user == message.author.id:
+			await record_deleted_message(message, "Counting channel violation")
 			await message.delete()
 			return
 		db("INSERT INTO counting(guild_id, channel_id, last_number, last_user_id) VALUES (?, ?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id, last_number=excluded.last_number, last_user_id=excluded.last_user_id", (message.guild.id, message.channel.id, value, message.author.id))
