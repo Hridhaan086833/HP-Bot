@@ -202,7 +202,8 @@ async def set_antinuke_lockdown(guild: discord.Guild, locked: bool):
 		ANTI_NUKE_LOCKDOWNS.add(guild.id)
 	else:
 		ANTI_NUKE_LOCKDOWNS.discard(guild.id)
-	for channel in guild.text_channels:
+
+	async def update_channel(channel: discord.TextChannel):
 		overwrite = channel.overwrites_for(guild.default_role)
 		if locked:
 			overwrite.send_messages = False
@@ -220,12 +221,26 @@ async def set_antinuke_lockdown(guild: discord.Guild, locked: bool):
 			overwrite.manage_webhooks = None
 		try:
 			await channel.set_permissions(guild.default_role, overwrite=overwrite, reason="Anti-nuke lockdown")
-		except discord.HTTPException:
+		except discord.DiscordException:
 			pass
+
+	await asyncio.gather(*(update_channel(channel) for channel in guild.text_channels))
 
 
 antinuke = app_commands.Group(name="antinuke", description="Configure anti-nuke protection")
 bot.tree.add_command(antinuke)
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+	if isinstance(error, app_commands.errors.MissingPermissions):
+		message = "You do not have permission to use this command."
+	else:
+		cause = getattr(error, "original", error)
+		print(f"Application command error: {cause!r}")
+		message = "The command could not be completed. Check the bot console for details."
+	if interaction.response.is_done():
+		await interaction.followup.send(message, ephemeral=True)
+	else:
+		await interaction.response.send_message(message, ephemeral=True)
 
 
 async def game_channel_check(interaction: discord.Interaction):
@@ -837,10 +852,11 @@ async def antinuke_limits(interaction: discord.Interaction, module: Literal["cha
 @antinuke.command(name="lockdown", description="Enable or disable lockdown mode")
 @app_commands.checks.has_permissions(administrator=True)
 async def antinuke_lockdown(interaction: discord.Interaction, status: Literal["enable", "disable"]):
+	await interaction.response.defer(ephemeral=True)
 	ensure_antinuke(interaction.guild.id) # type: ignore
 	db("UPDATE antinuke_config SET lockdown=? WHERE guild_id=?", (status == "enable", interaction.guild.id)) # type: ignore
 	await set_antinuke_lockdown(interaction.guild, status == "enable") # type: ignore
-	await interaction.response.send_message(f"Anti-nuke lockdown {status}d.", ephemeral=True)
+	await interaction.followup.send(f"Anti-nuke lockdown {status}d.", ephemeral=True)
 
 
 @antinuke.command(name="punishment", description="Choose the response to a detected attack")
@@ -864,11 +880,12 @@ async def antinuke_quarantine_role(interaction: discord.Interaction, role: disco
 @antinuke.command(name="recover", description="Clear events and disable lockdown")
 @app_commands.checks.has_permissions(administrator=True)
 async def antinuke_recover(interaction: discord.Interaction):
+	await interaction.response.defer(ephemeral=True)
 	ensure_antinuke(interaction.guild.id) # type: ignore
 	db("UPDATE antinuke_config SET lockdown=0 WHERE guild_id=?", (interaction.guild.id,)) # type: ignore
 	db("DELETE FROM antinuke_events WHERE guild_id=?", (interaction.guild.id,)) # type: ignore
 	await set_antinuke_lockdown(interaction.guild, False) # type: ignore
-	await interaction.response.send_message("Anti-nuke recovery complete; lockdown disabled.", ephemeral=True)
+	await interaction.followup.send("Anti-nuke recovery complete; lockdown disabled.", ephemeral=True)
 
 
 @antinuke.command(name="reset", description="Reset anti-nuke settings")
@@ -1504,7 +1521,7 @@ async def warn_media_only(message):
 	except discord.HTTPException:
 		try:
 			await message.channel.send(f"{message.author.mention}, {warning}", delete_after=8)
-		except discord.HTTPException:
+		except discord.Forbidden:
 			pass
 
 
@@ -2186,16 +2203,16 @@ async def antinuke_guard_event(guild: discord.Guild, module: str, target_id: int
 	count_row = db("SELECT COUNT(*) FROM antinuke_events WHERE guild_id=? AND user_id=? AND module=? AND created_at>=?", (guild.id, actor.id, module, cutoff), True)
 	count = count_row[0][0] if count_row else 0
 	log_channel = guild.get_channel(config[4]) if config[4] is not None else None
-	if isinstance(log_channel, discord.TextChannel):
-		event_embed = discord.Embed(title="Anti-nuke event detected", description=f"A `{module}` action was detected.", color=discord.Color.orange())
-		event_embed.add_field(name="Actor", value=f"{actor.mention} (`{actor.id}`)", inline=True)
-		event_embed.add_field(name="Activity", value=f"{count}/{limit} actions in {window}s", inline=True)
-		event_embed.add_field(name="Status", value="Limit reached" if count >= limit else "Monitoring", inline=True)
-		try:
-			await log_channel.send(embed=event_embed)
-		except (discord.Forbidden, discord.HTTPException):
-			pass
 	if count < limit:
+		if isinstance(log_channel, discord.TextChannel):
+			event_embed = discord.Embed(title="Anti-nuke event detected", description=f"A `{module}` action was detected.", color=discord.Color.orange())
+			event_embed.add_field(name="Actor", value=f"{actor.mention} (`{actor.id}`)", inline=True)
+			event_embed.add_field(name="Activity", value=f"{count}/{limit} actions in {window}s", inline=True)
+			event_embed.add_field(name="Status", value="Monitoring", inline=True)
+			try:
+				await log_channel.send(embed=event_embed)
+			except discord.DiscordException:
+				pass
 		return
 	if member is not None and member.bot:
 		db("UPDATE antinuke_config SET lockdown=1 WHERE guild_id=?", (guild.id,))
