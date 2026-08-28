@@ -81,7 +81,8 @@ XP_PER_MESSAGE = max(1, env_int("XP_PER_MESSAGE") or 10)
 DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ticket_bot.sqlite3")
 MEDIA_LINK_HOSTS = {"youtube.com", "youtu.be", "imgur.com", "i.imgur.com", "tenor.com", "media.tenor.com"}
 GAME_COMMANDS = {"tic-tac-toe", "rps", "roulette", "trivia", "guess", "hangman", "connect-four", "wordle", "slot", "coinflip", "roll", "blackjack", "unscramble", "emoji-quiz", "truth-or-dare", "high-low", "minefield", "pokemon-guess", "math-race", "explore"}
-ANTINUKE_MODULES = ("channel_delete", "role_delete", "member_ban", "member_kick")
+ANTINUKE_MODULES = ("channel_delete", "role_delete", "channel_update", "role_update", "guild_update", "member_ban", "member_kick")
+ANTI_NUKE_LOCKDOWNS: set[int] = set()
 
 CATEGORIES = {
 	"store": ("Store / Purchase Rank", "Minecraft IGN and proof or order links."),
@@ -163,6 +164,7 @@ def init_db():
 	db("CREATE TABLE IF NOT EXISTS confessions (message_id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL, content TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending')")
 	db("CREATE TABLE IF NOT EXISTS temporary_voice (channel_id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL, owner_id INTEGER NOT NULL)")
 	db("CREATE TABLE IF NOT EXISTS media_only_channels (guild_id INTEGER NOT NULL, channel_id INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(guild_id, channel_id))")
+	db("CREATE TABLE IF NOT EXISTS media_link_roles (guild_id INTEGER PRIMARY KEY, role_id INTEGER NOT NULL)")
 	if not db("SELECT name FROM items", fetch=True):
 		db("INSERT INTO items VALUES (?, ?, ?)", [
 			("VIP", 500, "VIP server role"),
@@ -176,7 +178,7 @@ def balance(user_id):
 	return db("SELECT balance FROM users WHERE id=?", (user_id,), True)[0][0] # type: ignore
 
 
-ANTINUKE_MODULES = ("channel_delete", "role_delete", "member_ban", "member_kick")
+ANTINUKE_MODULES = ("channel_delete", "role_delete", "channel_update", "role_update", "guild_update", "member_ban", "member_kick")
 
 
 def ensure_antinuke(guild_id):
@@ -184,6 +186,7 @@ def ensure_antinuke(guild_id):
 	for module in ANTINUKE_MODULES:
 		db("INSERT OR IGNORE INTO antinuke_modules(guild_id, module) VALUES (?, ?)", (guild_id, module))
 		db("INSERT OR IGNORE INTO antinuke_limits(guild_id, module) VALUES (?, ?)", (guild_id, module))
+	db("UPDATE antinuke_limits SET max_actions=1 WHERE guild_id=? AND max_actions=3", (guild_id,))
 
 
 def get_antinuke_config(guild_id):
@@ -193,9 +196,30 @@ def get_antinuke_config(guild_id):
 
 
 async def set_antinuke_lockdown(guild: discord.Guild, locked: bool):
+	if locked and guild.id in ANTI_NUKE_LOCKDOWNS:
+		return
+	if locked:
+		ANTI_NUKE_LOCKDOWNS.add(guild.id)
+	else:
+		ANTI_NUKE_LOCKDOWNS.discard(guild.id)
 	for channel in guild.text_channels:
+		overwrite = channel.overwrites_for(guild.default_role)
+		if locked:
+			overwrite.send_messages = False
+			overwrite.create_public_threads = False
+			overwrite.create_private_threads = False
+			overwrite.send_messages_in_threads = False
+			overwrite.manage_channels = False
+			overwrite.manage_webhooks = False
+		else:
+			overwrite.send_messages = None
+			overwrite.create_public_threads = None
+			overwrite.create_private_threads = None
+			overwrite.send_messages_in_threads = None
+			overwrite.manage_channels = None
+			overwrite.manage_webhooks = None
 		try:
-			await channel.set_permissions(guild.default_role, send_messages=False if locked else None, reason="Anti-nuke lockdown")
+			await channel.set_permissions(guild.default_role, overwrite=overwrite, reason="Anti-nuke lockdown")
 		except discord.HTTPException:
 			pass
 
@@ -796,7 +820,7 @@ async def antinuke_disable(interaction: discord.Interaction):
 
 @antinuke.command(name="guard", description="Enable or disable a protection module")
 @app_commands.checks.has_permissions(administrator=True)
-async def antinuke_guard(interaction: discord.Interaction, module: Literal["channel_delete", "role_delete", "member_ban", "member_kick"], status: Literal["enable", "disable"]):
+async def antinuke_guard(interaction: discord.Interaction, module: Literal["channel_delete", "role_delete", "channel_update", "role_update", "guild_update", "member_ban", "member_kick"], status: Literal["enable", "disable"]):
 	ensure_antinuke(interaction.guild.id) # type: ignore
 	db("UPDATE antinuke_modules SET enabled=? WHERE guild_id=? AND module=?", (status == "enable", interaction.guild.id, module)) # type: ignore
 	await interaction.response.send_message(f"Guard `{module}` {status}d.", ephemeral=True)
@@ -804,7 +828,7 @@ async def antinuke_guard(interaction: discord.Interaction, module: Literal["chan
 
 @antinuke.command(name="limits", description="Set a module action limit")
 @app_commands.checks.has_permissions(administrator=True)
-async def antinuke_limits(interaction: discord.Interaction, module: Literal["channel_delete", "role_delete", "member_ban", "member_kick"], limit: app_commands.Range[int, 1, 100]):
+async def antinuke_limits(interaction: discord.Interaction, module: Literal["channel_delete", "role_delete", "channel_update", "role_update", "guild_update", "member_ban", "member_kick"], limit: app_commands.Range[int, 1, 100]):
 	ensure_antinuke(interaction.guild.id) # type: ignore
 	db("UPDATE antinuke_limits SET max_actions=? WHERE guild_id=? AND module=?", (limit, interaction.guild.id, module)) # type: ignore
 	await interaction.response.send_message(f"Limit for `{module}` set to {limit} actions.", ephemeral=True)
@@ -1428,6 +1452,44 @@ def has_media(message):
 	return False
 
 
+def media_link_category(url: str):
+	host = (urlparse(url).hostname or "").lower().rstrip(".")
+	lower = url.lower()
+	path = urlparse(url).path.lower()
+	query = urlparse(url).query.lower()
+	if any(ext in path for ext in (".gif", ".gifv")) or "format=gif" in query:
+		return "gif"
+	if any(ext in path for ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp")) or any(format_name in query for format_name in ("format=png", "format=jpg", "format=jpeg", "format=webp")):
+		return "photo"
+	if any(ext in path for ext in (".mp4", ".mov", ".webm", ".m4v", ".avi", ".mkv")) or any(format_name in query for format_name in ("format=mp4", "format=webm")):
+		return "video"
+	if any(host == domain or host.endswith(f".{domain}") for domain in ("tenor.com", "media.tenor.com", "giphy.com", "i.giphy.com", "redgifs.com")):
+		return "gif"
+	if any(host == domain or host.endswith(f".{domain}") for domain in ("youtube.com", "youtu.be", "vimeo.com", "tiktok.com", "twitter.com", "x.com", "streamable.com", "clips.twitch.tv")):
+		return "video"
+	if any(host == domain or host.endswith(f".{domain}") for domain in ("imgur.com", "i.imgur.com", "images.unsplash.com", "cdn.discordapp.com", "media.discordapp.net")):
+		return "photo"
+	return None
+
+
+def configured_media_role(guild: discord.Guild):
+	row = db("SELECT role_id FROM media_link_roles WHERE guild_id=?", (guild.id,), True)
+	return guild.get_role(row[0][0]) if row else None
+
+
+def has_unauthorized_media_link(message):
+	if message.attachments:
+		return False
+	role = configured_media_role(message.guild)
+	if role is None:
+		return False
+	if not isinstance(message.author, discord.Member):
+		return False
+	if message.author.get_role(role.id) is not None:
+		return False
+	return any(media_link_category(url) for url in URL_PATTERN.findall(message.content))
+
+
 def media_only_enabled(guild_id, channel_id):
 	if channel_id in MEDIA_CHANNEL_IDS:
 		return True
@@ -1444,6 +1506,42 @@ async def warn_media_only(message):
 			await message.channel.send(f"{message.author.mention}, {warning}", delete_after=8)
 		except discord.HTTPException:
 			pass
+
+
+@bot.tree.command(name="media-role", description="Choose the role allowed to post GIF, video, and photo links")
+@app_commands.checks.has_permissions(manage_messages=True)
+@app_commands.describe(role="Only members with this role may post media links")
+async def media_role(interaction: discord.Interaction, role: discord.Role):
+	if interaction.guild is None:
+		return await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+	if role.is_default():
+		return await interaction.response.send_message("Choose a role other than @everyone.", ephemeral=True)
+	db("INSERT INTO media_link_roles(guild_id, role_id) VALUES (?, ?) ON CONFLICT(guild_id) DO UPDATE SET role_id=excluded.role_id", (interaction.guild.id, role.id))
+	await interaction.response.send_message(f"Only members with {role.mention} can now post GIF, video, and photo links.", ephemeral=True)
+
+
+role_group = app_commands.Group(name="role", description="Manage the server media-link role")
+bot.tree.add_command(role_group)
+
+
+@role_group.command(name="add", description="Give the configured media-link role to a member")
+@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.describe(member="Member who should be allowed to post media links")
+async def role_add(interaction: discord.Interaction, member: discord.Member):
+	if interaction.guild is None or interaction.guild.me is None:
+		return await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+	role = configured_media_role(interaction.guild)
+	if role is None:
+		return await interaction.response.send_message("Configure the media role first with `/media-role @Role`.", ephemeral=True)
+	if role >= interaction.guild.me.top_role or member == interaction.guild.me:
+		return await interaction.response.send_message("I cannot manage that role or member because of role hierarchy.", ephemeral=True)
+	if role in member.roles:
+		return await interaction.response.send_message(f"{member.mention} already has {role.mention}.", ephemeral=True)
+	try:
+		await member.add_roles(role, reason=f"Media role granted by {interaction.user}")
+	except discord.Forbidden:
+		return await interaction.response.send_message("I need Manage Roles permission and a role hierarchy above the media role.", ephemeral=True)
+	await interaction.response.send_message(f"Added {role.mention} to {member.mention}. They can now post media links.", ephemeral=True)
 
 
 async def create_voice_room(member):
@@ -2056,6 +2154,9 @@ async def antinuke_guard_event(guild: discord.Guild, module: str, target_id: int
 	audit_action = {
 		"channel_delete": discord.AuditLogAction.channel_delete,
 		"role_delete": discord.AuditLogAction.role_delete,
+		"channel_update": discord.AuditLogAction.channel_update,
+		"role_update": discord.AuditLogAction.role_update,
+		"guild_update": discord.AuditLogAction.guild_update,
 		"member_ban": discord.AuditLogAction.ban,
 		"member_kick": discord.AuditLogAction.kick,
 	}[module]
@@ -2069,8 +2170,11 @@ async def antinuke_guard_event(guild: discord.Guild, module: str, target_id: int
 		return
 	if actor is None or (bot.user is not None and actor.id == bot.user.id):
 		return
+	member = guild.get_member(actor.id)
+	if member is not None and not member.bot and (member.guild_permissions.administrator or member == guild.owner):
+		return
 	whitelisted = db("SELECT 1 FROM antinuke_whitelist WHERE guild_id=? AND user_id=?", (guild.id, actor.id), True)
-	if whitelisted:
+	if whitelisted and not (member is not None and member.bot):
 		return
 	now = datetime.now(timezone.utc)
 	db("INSERT INTO antinuke_events VALUES (?, ?, ?, ?)", (guild.id, actor.id, module, now.isoformat()))
@@ -2078,7 +2182,7 @@ async def antinuke_guard_event(guild: discord.Guild, module: str, target_id: int
 	cutoff = (now - timedelta(seconds=window)).isoformat()
 	db("DELETE FROM antinuke_events WHERE created_at < ?", (cutoff,))
 	limit_row = db("SELECT max_actions FROM antinuke_limits WHERE guild_id=? AND module=?", (guild.id, module), True)
-	limit = limit_row[0][0] if limit_row else 3
+	limit = min(limit_row[0][0], 1) if limit_row else 1
 	count_row = db("SELECT COUNT(*) FROM antinuke_events WHERE guild_id=? AND user_id=? AND module=? AND created_at>=?", (guild.id, actor.id, module, cutoff), True)
 	count = count_row[0][0] if count_row else 0
 	log_channel = guild.get_channel(config[4]) if config[4] is not None else None
@@ -2093,7 +2197,13 @@ async def antinuke_guard_event(guild: discord.Guild, module: str, target_id: int
 			pass
 	if count < limit:
 		return
-	member = guild.get_member(actor.id)
+	if member is not None and member.bot:
+		db("UPDATE antinuke_config SET lockdown=1 WHERE guild_id=?", (guild.id,))
+		await set_antinuke_lockdown(guild, True)
+		try:
+			await member.edit(roles=[], reason=f"Anti-nuke: contain bot after {module}")
+		except discord.HTTPException:
+			pass
 	if isinstance(member, discord.Member) and member != guild.owner and guild.me and member.top_role < guild.me.top_role:
 		try:
 			if config[2] == "ban":
@@ -2104,9 +2214,13 @@ async def antinuke_guard_event(guild: discord.Guild, module: str, target_id: int
 				role = guild.get_role(config[3])
 				if role:
 					await member.add_roles(role, reason=f"Anti-nuke: {module} limit exceeded")
+				else:
+					await member.kick(reason=f"Anti-nuke: {module} quarantine role unavailable")
+			elif config[2] == "quarantine":
+				await member.kick(reason=f"Anti-nuke: {module} quarantine role not configured")
 		except discord.HTTPException:
 			pass
-	if config[1]:
+	if config[1] and guild.id not in ANTI_NUKE_LOCKDOWNS:
 		await set_antinuke_lockdown(guild, True)
 	if config[4] is not None:
 		if isinstance(log_channel, discord.TextChannel):
@@ -2125,6 +2239,21 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
 @bot.event
 async def on_guild_role_delete(role: discord.Role):
 	await antinuke_guard_event(role.guild, "role_delete", role.id)
+
+
+@bot.event
+async def on_guild_channel_update(before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
+	await antinuke_guard_event(after.guild, "channel_update", after.id)
+
+
+@bot.event
+async def on_guild_role_update(before: discord.Role, after: discord.Role):
+	await antinuke_guard_event(after.guild, "role_update", after.id)
+
+
+@bot.event
+async def on_guild_update(before: discord.Guild, after: discord.Guild):
+	await antinuke_guard_event(after, "guild_update", after.id)
 
 
 @bot.event
@@ -2147,6 +2276,14 @@ async def on_message(message):
 	if message.author.bot or not message.guild:
 		return await bot.process_commands(message)
 	if await scan_message_links(message):
+		return
+	if has_unauthorized_media_link(message):
+		await record_deleted_message(message, "Media link requires configured role")
+		await message.delete()
+		try:
+			await message.channel.send(f"{message.author.mention}, you do not have media-link access for that GIF, video, or photo link.", delete_after=8)
+		except discord.HTTPException:
+			pass
 		return
 	if media_only_enabled(message.guild.id, message.channel.id) and not has_media(message):
 		await record_deleted_message(message, "Media-only channel")
