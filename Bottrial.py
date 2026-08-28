@@ -7,9 +7,17 @@ import operator
 import asyncio
 import random
 import string
+import time
+import sys
+import tracemalloc
 from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
+
+try:
+	import psutil  # type: ignore[import-not-found]
+except ImportError:
+	psutil = None
 
 import discord  # type: ignore[import-not-found]
 from discord.ext import commands
@@ -89,6 +97,17 @@ intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 GIVEAWAY_TASKS: dict[int, asyncio.Task] = {}
+BOT_START_TIME = datetime.now(timezone.utc)
+tracemalloc.start()
+
+
+def format_bytes(value: int | float) -> str:
+	current = float(value)
+	for unit in ("B", "KB", "MB", "GB"):
+		if current < 1024 or unit == "GB":
+			return f"{current:.2f} {unit}" if unit != "B" else f"{int(current)} {unit}"
+		current /= 1024
+	return f"{current:.2f} GB"
 
 
 def db(query, args=(), fetch=False, many=False):
@@ -273,7 +292,17 @@ async def log_ticket(channel: discord.TextChannel, closed_by: discord.abc.User):
 	creator_display = creator.mention if creator else f"<@{creator_id}>"
 	claimant = channel.guild.get_member(claimed_by) if claimed_by else None
 	claimant_display = claimant.mention if claimant else (f"<@{claimed_by}>" if claimed_by else "Not claimed")
-	lines = [f"Ticket transcript: #{channel.name}", f"Created by: {creator_display} ({creator_id})", f"Category: {category}", f"Closed by: {closed_by} ({closed_by.id})", ""]
+	transcript_header = [
+		"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+		f"📌 Ticket transcript: #{channel.name}",
+		f"👤 Created by: {creator_display} ({creator_id})",
+		f"🎫 Category: {category}",
+		f"🔒 Closed by: {closed_by} ({closed_by.id})",
+		f"⏰ Closed at: {datetime.now(timezone.utc).isoformat()}",
+		"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+		"",
+	]
+	lines = transcript_header.copy()
 	try:
 		first_message = None
 		async for message in channel.history(limit=None, oldest_first=True):
@@ -282,8 +311,8 @@ async def log_ticket(channel: discord.TextChannel, closed_by: discord.abc.User):
 			content = message.content or "[no text]"
 			attachments = " ".join(attachment.url for attachment in message.attachments)
 			if attachments:
-				content = f"{content} Attachments: {attachments}"
-			lines.append(f"[{message.created_at.isoformat()}] {message.author} ({message.author.id}): {content}")
+				content = f"{content}\n📎 Attachments: {attachments}"
+			lines.append(f"🕒 [{message.created_at.isoformat()}] 👤 {message.author} ({message.author.id}): {content}")
 		transcript = "\n".join(lines)
 		if len(transcript.encode("utf-8")) > 7_000_000:
 			transcript = transcript.encode("utf-8")[:7_000_000].decode("utf-8", errors="ignore") + "\n[Transcript truncated]"
@@ -296,17 +325,17 @@ async def log_ticket(channel: discord.TextChannel, closed_by: discord.abc.User):
 					details = field.value
 				elif field.name == "Minecraft IGN":
 					minecraft_ign = field.value
-		embed = discord.Embed(title="Ticket closed", description=f"Ticket **#{channel.name}** has been closed and archived.", color=discord.Color.red())
-		embed.add_field(name="Created by", value=f"{creator_display}\nID: `{creator_id}`", inline=True)
-		embed.add_field(name="Category", value=category.replace("_", " ").title(), inline=True)
-		embed.add_field(name="Minecraft IGN", value=minecraft_ign, inline=True)
-		embed.add_field(name="Reason / Details", value=details[:1024], inline=False) # type: ignore
-		embed.add_field(name="Claimed by", value=claimant_display, inline=True)
-		embed.add_field(name="Claimed at", value=claimed_at or "Not claimed", inline=True)
-		embed.add_field(name="Closed by", value=f"{closed_by.mention}\nID: `{closed_by.id}`", inline=True)
-		embed.add_field(name="Created at", value=created_at, inline=True)
-		embed.add_field(name="Closed at", value=datetime.now(timezone.utc).isoformat(), inline=True)
-		embed.set_footer(text="Full ticket conversation attached as a transcript")
+		embed = discord.Embed(title="🧾 Ticket closed", description=f"Ticket **#{channel.name}** has been archived and logged for review.", color=discord.Color.red())
+		embed.add_field(name="👤 Created by", value=f"{creator_display}\nID: `{creator_id}`", inline=True)
+		embed.add_field(name="🎫 Category", value=category.replace("_", " ").title(), inline=True)
+		embed.add_field(name="🧩 Minecraft IGN", value=minecraft_ign, inline=True)
+		embed.add_field(name="📝 Reason / Details", value=details[:1024], inline=False) # type: ignore
+		embed.add_field(name="📎 Claimed by", value=claimant_display, inline=True)
+		embed.add_field(name="⏱️ Claimed at", value=claimed_at or "Not claimed", inline=True)
+		embed.add_field(name="🔒 Closed by", value=f"{closed_by.mention}\nID: `{closed_by.id}`", inline=True)
+		embed.add_field(name="🗓️ Created at", value=created_at, inline=True)
+		embed.add_field(name="🕰️ Closed at", value=datetime.now(timezone.utc).isoformat(), inline=True)
+		embed.set_footer(text="📄 Full ticket conversation attached as a transcript")
 		await log_channel.send(embed=embed, file=file)
 	except (discord.HTTPException, discord.Forbidden) as error:
 		print(f"Ticket log failed for {channel.name}: {error!r}")
@@ -1162,21 +1191,68 @@ async def ask(interaction: discord.Interaction, question: str):
 		await interaction.followup.send("Gemini could not answer right now. Check the bot console and Gemini API key.")
 
 
+async def _run_health_report(interaction: discord.Interaction):
+	loop_start = time.perf_counter()
+	await asyncio.sleep(0.02)
+	loop_delay_ms = (time.perf_counter() - loop_start) * 1000
+
+	if psutil is not None:
+		process = psutil.Process()
+		mem_used = process.memory_info().rss
+		mem_peak = tracemalloc.get_traced_memory()[1]
+		memory_line = f"RSS: {format_bytes(mem_used)} | Python peak: {format_bytes(mem_peak)}"
+	else:
+		current_mem, peak_mem = tracemalloc.get_traced_memory()
+		memory_line = f"Python memory: {format_bytes(current_mem)} | Peak: {format_bytes(peak_mem)}"
+
+	uptime = datetime.now(timezone.utc) - BOT_START_TIME
+	hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+	minutes, seconds = divmod(remainder, 60)
+
+	embed = discord.Embed(title="🤖 Bot Health", color=discord.Color.blurple())
+	embed.add_field(name="📡 Websocket Ping", value=f"{bot.latency * 1000:.0f} ms", inline=True)
+	embed.add_field(name="⚡ Event Loop Delay", value=f"{loop_delay_ms:.2f} ms", inline=True)
+	embed.add_field(name="🧠 Memory", value=memory_line, inline=False)
+	embed.add_field(name="⏱️ Uptime", value=f"{hours}h {minutes}m {seconds}s", inline=True)
+	embed.add_field(name="🖥️ Guilds", value=str(len(bot.guilds)), inline=True)
+	embed.add_field(name="👥 Members", value=str(sum(g.member_count or 0 for g in bot.guilds)), inline=True)
+	embed.add_field(name="🧩 Version", value=f"discord.py {discord.__version__}", inline=True)
+	embed.add_field(name="🐍 Python", value=sys.version.split()[0], inline=True)
+	embed.add_field(name="🕒 Local Time", value=datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC%z"), inline=False)
+	await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="health", description="Inspect bot uptime, latency, memory, and runtime status")
+async def health(interaction: discord.Interaction):
+	await _run_health_report(interaction)
+
+
+@bot.tree.command(name="status", description="Alias for bot health and uptime status")
+async def status(interaction: discord.Interaction):
+	await _run_health_report(interaction)
+
+
+@bot.command(name="health")
+async def health_text(ctx):
+	await ctx.send("Use `/health` or `/status` for the bot status check.")
+
+
 @bot.tree.command(name="help", description="Show the bot commands and how to use them")
 @app_commands.describe(category="Show one command category or everything")
-async def help_command(interaction: discord.Interaction, category: Literal["all", "support", "moderation", "economy", "games", "setup", "antinuke"] = "all"):
+async def help_command(interaction: discord.Interaction, category: Literal["all", "support", "moderation", "economy", "games", "setup", "antinuke", "status"] = "all"):
 	embed = discord.Embed(
 		title="Bot Help",
 		description="Use the commands below to get started. Choose a category to focus the list.",
 		color=discord.Color.blurple(),
 	)
 	sections = {
-		"support": ("Support", "`/suggest` Submit a suggestion\n`/confess` Send an anonymous confession\n`/ask question:<text>` Ask the AI assistant"),
+		"support": ("Support", "`/suggest` Submit a suggestion\n`/confess` Send an anonymous confession\n`/ask question:<text>` Ask the AI assistant\n`/health` or `/status` Check bot latency, memory, and uptime"),
 		"moderation": ("Moderation", "`/kick member:<member>` Kick a member\n`/ban member:<member>` Ban a member\n`/mute member:<member> duration:<minutes>` Timeout a member\n`/unmute member:<member>` Remove a timeout\n`/unban user_id:<id>` Unban a user\n`/deleted-logs limit:<number>` Review deleted messages\n`/setup-moderation-role` Create a moderator role and admin control panel"),
 		"antinuke": ("Anti-nuke (Administrators)", "`/antinuke enable|disable` Turn protection on or off\n`/antinuke guard module status` Toggle a guard module\n`/antinuke limits module limit` Set action limits\n`/antinuke lockdown status` Toggle lockdown\n`/antinuke punishment action` Set ban, kick, quarantine, or none\n`/antinuke quarantinerole role` Set the quarantine role\n`/antinuke recover` Clear events and unlock\n`/antinuke reset` Restore defaults\n`/antinuke status` View current settings\n`/antinuke timewindow seconds` Set detection window\n`/antinuke whitelist member action` Manage whitelist\n`/antinuke setlogs channel` Set the log channel"),
 		"economy": ("Coins and Shop", "`/leaderboard` See the top 10 coin holders\n`/shop` View useful rewards\n`/buy item:<name>` Spend coins on an item\n`/rank` View your activity XP and level"),
 		"games": ("Games", "`/tic-tac-toe opponent:<member>` Challenge a member\n`/rps opponent:<member>` Play Rock Paper Scissors\n`/pokemon-guess` Guess a Pokemon\n`/trivia` Answer a quiz\n`/slot bet:<amount>` Spin the slots\n`/blackjack` Play blackjack\n`/minefield` Clear the minefield\n`/coinflip choice:<heads|tails> bet:<amount>` Bet on a coin flip\n`/roll sides:<number>` Roll a die\n`/guess` Guess a number\n`/hangman` Start hangman\n`/wordle` Start Wordle\n`/unscramble` Solve a scrambled word\n`/emoji-quiz` Guess the movie\n`/math-race` Solve a math problem\n`/high-low guess:<high|low>` Guess the next card\n`/truth-or-dare` Get a prompt\n`/explore` Explore a dungeon"),
 		"setup": ("Server Setup (Administrators)", "`/giveaway prize:<text> duration:<minutes> winners:<number>` Create a giveaway\n`/setup-game-channel channel:<channel>` Restrict games to one channel\n`/setup-suggestion-channel channel:<channel>` Choose the suggestion channel\n`/setup-ticket-log channel:<channel>` Store closed ticket transcripts\n`/setup-deletion-logs channel:<channel>` Archive deleted messages\n`/setup-ticket` Post the ticket panel; staff can claim tickets with the Claim button\n`/setup-reaction-roles` Post the role panel\n`/mediaonly channel:<channel> status:<enable|disable>` Toggle media-only mode\n`/audit` Scan common server risks"),
+		"status": ("System Status", "`/health` or `/status` Inspect bot latency, memory, uptime, and current runtime stats"),
 	}
 	selected_sections = sections.values() if category == "all" else [sections[category]]
 	for name, value in selected_sections:
@@ -1406,6 +1482,13 @@ class TicTacToeView(discord.ui.View):
 			button.callback = self.make_callback(index)
 			self.add_item(button)
 
+	def board_text(self):
+		lines = []
+		for row in range(3):
+			cells = " | ".join(self.board[row * 3 + i] for i in range(3))
+			lines.append(f"{cells}")
+		return "\n".join(lines)
+
 	def make_callback(self, index):
 		async def callback(interaction):
 			if interaction.user != self.players[self.turn]:
@@ -1427,9 +1510,9 @@ class TicTacToeView(discord.ui.View):
 					result = f"🏆 {winner_member.mention} wins Tic-Tac-Toe! {loser_member.mention}, better luck next time."
 				else:
 					result = f"🤝 Draw! {self.players[0].mention} and {self.players[1].mention} tied."
-				return await interaction.response.edit_message(content=result, view=self)
+				return await interaction.response.edit_message(content=f"{result}\n\nBoard:\n{self.board_text()}", view=self)
 			self.turn = 1 - self.turn
-			await interaction.response.edit_message(content=f"🎮 {self.players[0].mention} (X) vs {self.players[1].mention} (O)\nTurn: {self.players[self.turn].mention}", view=self)
+			await interaction.response.edit_message(content=f"🎮 {self.players[0].mention} (X) vs {self.players[1].mention} (O)\nBoard:\n{self.board_text()}\n\nTurn: {self.players[self.turn].mention}", view=self)
 		return callback
 
 	async def on_timeout(self):
@@ -1441,8 +1524,88 @@ class TicTacToeView(discord.ui.View):
 	def winner(self):
 		for line in ((0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6), (1, 4, 7), (2, 5, 8), (0, 4, 8), (2, 4, 6)):
 			if self.board[line[0]] != " " and len({self.board[i] for i in line}) == 1:
-				return f"{self.board[line[0]]} wins!"
+				return self.board[line[0]]
 		return None
+
+
+class ConnectFourView(discord.ui.View):
+	def __init__(self, first: discord.Member, second: discord.Member):
+		super().__init__(timeout=180)
+		self.players = [first, second]
+		self.board = [[" "] * 5 for _ in range(5)]
+		self.turn = 0
+		self.message: Optional[discord.Message] = None
+		for row in range(5):
+			for col in range(5):
+				button = discord.ui.Button(label="⚪", style=discord.ButtonStyle.secondary, row=row, custom_id=f"cf:{row}:{col}")
+				button.callback = self.make_callback(row, col)
+				self.add_item(button)
+
+	def board_text(self):
+		header = "  1  2  3  4  5"
+		rows = [header]
+		for row in self.board:
+			rows.append(" ".join(cell if cell != " " else "⚪" for cell in row))
+		return "\n".join(rows)
+
+	def next_open_slot(self, col):
+		for row in range(4, -1, -1):
+			if self.board[row][col] == " ":
+				return row
+		return None
+
+	def winner(self, symbol):
+		for row in range(5):
+			for col in range(5):
+				if self.board[row][col] != symbol:
+					continue
+				for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
+					count = 1
+					for step in range(1, 4):
+						nr = row + dr * step
+						nc = col + dc * step
+						if 0 <= nr < 5 and 0 <= nc < 5 and self.board[nr][nc] == symbol:
+							count += 1
+						else:
+							break
+					if count >= 4:
+						return True
+		return False
+
+	def make_callback(self, row, col):
+		async def callback(interaction):
+			if interaction.user != self.players[self.turn]:
+				return await interaction.response.send_message("Wait for your turn.", ephemeral=True)
+			lowest_row = self.next_open_slot(col)
+			if lowest_row is None:
+				return await interaction.response.send_message("That column is full. Pick another open column.", ephemeral=True)
+			if row != lowest_row:
+				return await interaction.response.send_message("Click any open space in the column to drop your token to the lowest available slot.", ephemeral=True)
+			symbol = "🔴" if self.turn == 0 else "🟡"
+			self.board[lowest_row][col] = symbol
+			button = self.children[lowest_row * 5 + col]
+			button.label = symbol
+			button.style = discord.ButtonStyle.red if self.turn == 0 else discord.ButtonStyle.blurple
+			button.disabled = True
+			if self.winner(symbol):
+				for item in self.children:
+					item.disabled = True # type: ignore
+				winner_member = self.players[self.turn]
+				loser_member = self.players[1 - self.turn]
+				return await interaction.response.edit_message(content=f"🏆 {winner_member.mention} wins Connect Four! {loser_member.mention}, better luck next time.\n\n{self.board_text()}", view=self)
+			if all(cell != " " for row_cells in self.board for cell in row_cells):
+				for item in self.children:
+					item.disabled = True # type: ignore
+				return await interaction.response.edit_message(content=f"🤝 Draw! {self.players[0].mention} and {self.players[1].mention} tied on the 5x5 board.\n\n{self.board_text()}", view=self)
+			self.turn = 1 - self.turn
+			await interaction.response.edit_message(content=f"🎮 {self.players[0].mention} 🔴 vs {self.players[1].mention} 🟡\n{self.board_text()}\n\nTurn: {self.players[self.turn].mention}\nTip: click any open slot in a column and it will drop to the lowest available spot.", view=self)
+		return callback
+
+	async def on_timeout(self):
+		for item in self.children:
+			item.disabled = True # type: ignore
+		if self.message:
+			await self.message.edit(content=f"⌛ Connect Four expired. {self.players[0].mention} and {self.players[1].mention}, start a new game to play again.", view=self)
 
 
 class GameChallengeView(discord.ui.View):
@@ -1466,6 +1629,10 @@ class GameChallengeView(discord.ui.View):
 		if self.game == "tic-tac-toe":
 			game_view = TicTacToeView(self.challenger, self.opponent)
 			await interaction.response.edit_message(content=f"🎮 {self.challenger.mention} (X) vs {self.opponent.mention} (O)\nTurn: {self.challenger.mention}", view=game_view)
+			game_view.message = await interaction.original_response()
+		elif self.game == "connect-four":
+			game_view = ConnectFourView(self.challenger, self.opponent)
+			await interaction.response.edit_message(content=f"🎮 {self.challenger.mention} 🔴 vs {self.opponent.mention} 🟡\n{game_view.board_text()}\n\nTurn: {self.challenger.mention}\nTip: click any open square in a column to drop the token to the lowest available spot.", view=game_view)
 			game_view.message = await interaction.original_response()
 		else:
 			game_view = RPSView(self.challenger, self.opponent)
@@ -1513,31 +1680,77 @@ class BlackjackView(discord.ui.View):
 	def __init__(self, interaction):
 		super().__init__(timeout=120)
 		self.user = interaction.user
-		self.hand = [random.randint(1, 11), random.randint(1, 11)]
-		self.dealer = random.randint(1, 11)
+		self.hand = [self._draw_card(), self._draw_card()]
+		self.dealer = [self._draw_card(), self._draw_card()]
+		self.game_over = False
 
-	def total(self):
-		return sum(self.hand)
+	@staticmethod
+	def _draw_card():
+		return random.randint(1, 11)
+
+	@staticmethod
+	def hand_total(cards):
+		total = sum(cards)
+		aces = cards.count(11)
+		while total > 21 and aces:
+			total -= 10
+			aces -= 1
+		return total
+
+	def total(self, cards=None):
+		cards = self.hand if cards is None else cards
+		return self.hand_total(cards)
+
+	def dealer_visible_total(self):
+		if self.game_over:
+			return self.total(self.dealer)
+		return self.total([self.dealer[0]])
+
+	def describe_state(self):
+		if self.game_over:
+			return f"Your hand: {self.hand} ({self.total(self.hand)})\nDealer hand: {self.dealer} ({self.total(self.dealer)})"
+		return f"Your hand: {self.hand} ({self.total(self.hand)})\nDealer hand: [{self.dealer[0]}, ?] ({self.dealer[0]})"
+
+	async def finish_round(self, interaction, result_text):
+		self.game_over = True
+		for item in self.children:
+			item.disabled = True # type: ignore
+		await interaction.response.edit_message(content=f"{self.describe_state()}\n\n{result_text}", view=self)
 
 	@discord.ui.button(label="Hit", style=discord.ButtonStyle.green)
 	async def hit(self, interaction, button):
 		if interaction.user != self.user:
 			return await interaction.response.send_message("This hand is not yours.", ephemeral=True)
-		self.hand.append(random.randint(1, 11))
-		if self.total() >= 21:
-			button.disabled = True
-			self.stand.disabled = True
-		await interaction.response.edit_message(content=f"Your hand: {self.hand} ({self.total()})", view=self)
+		if self.game_over:
+			return await interaction.response.send_message("This round is already over. Start a new game to play again.", ephemeral=True)
+		self.hand.append(self._draw_card())
+		player_total = self.total(self.hand)
+		if player_total > 21:
+			return await self.finish_round(interaction, f"💥 Bust! {self.user.mention} went over 21. Dealer wins this round.")
+		if player_total == 21:
+			return await self.finish_round(interaction, f"🎯 Blackjack! {self.user.mention} reached exactly 21 and locked in the win.")
+		await interaction.response.edit_message(content=f"{self.describe_state()}\n\n🃏 You drew another card. Choose to hit again or stand.", view=self)
 
 	@discord.ui.button(label="Stand", style=discord.ButtonStyle.red)
 	async def stand(self, interaction, button):
 		if interaction.user != self.user:
 			return await interaction.response.send_message("This hand is not yours.", ephemeral=True)
-		dealer = self.dealer
-		while dealer < 17:
-			dealer += random.randint(1, 11)
-		result = f"🏆 {self.user.mention} wins!" if self.total() <= 21 and (dealer > 21 or self.total() > dealer) else f"Dealer wins. {self.user.mention}, better luck next time."
-		await interaction.response.edit_message(content=f"Your {self.total()} vs dealer {dealer}: {result}", view=None)
+		if self.game_over:
+			return await interaction.response.send_message("This round is already over. Start a new game to play again.", ephemeral=True)
+		dealer_total = self.total(self.dealer)
+		while dealer_total < 17:
+			self.dealer.append(self._draw_card())
+			dealer_total = self.total(self.dealer)
+		player_total = self.total(self.hand)
+		if dealer_total > 21:
+			result = f"🏆 Dealer busts! {self.user.mention} wins this round."
+		elif player_total > dealer_total:
+			result = f"🏆 {self.user.mention} wins! Your total {player_total} beats the dealer's {dealer_total}."
+		elif player_total == dealer_total:
+			result = f"🤝 Push! {self.user.mention} and the dealer both landed on {player_total}."
+		else:
+			result = f"💸 Dealer wins. {self.user.mention}, better luck next time. Dealer scored {dealer_total} to your {player_total}."
+		await self.finish_round(interaction, result)
 
 
 class MinefieldView(discord.ui.View):
@@ -1669,10 +1882,13 @@ async def hangman(interaction: discord.Interaction):
 	await interaction.response.send_message(f"Hangman: {' '.join('_' for _ in word)} | 6 lives. Guess letters in chat.")
 
 
-@bot.tree.command(name="connect-four", description="Start a Connect Four match")
+@bot.tree.command(name="connect-four", description="Play Connect Four on a 5x5 board")
 @app_commands.check(game_channel_check)
-async def connect_four(interaction: discord.Interaction):
-	await interaction.response.send_message("Connect Four is ready: challenge another player with `/tic-tac-toe`; the full board expansion is reserved for the next game update.")
+async def connect_four(interaction: discord.Interaction, opponent: Optional[discord.Member] = None):
+	if opponent is None or opponent == interaction.user or opponent.bot:
+		return await interaction.response.send_message("Choose another human player to start a 5x5 Connect Four match.", ephemeral=True)
+	view = GameChallengeView(interaction.user, opponent, "connect-four")
+	await interaction.response.send_message(f"{opponent.mention}, {interaction.user.mention} has challenged you to Connect Four on a 5x5 board!\nFirst to connect 4 in a row wins.", view=view)
 
 
 @bot.tree.command(name="wordle", description="Play a five-letter Wordle round")
@@ -1744,7 +1960,11 @@ async def roll(interaction: discord.Interaction, sides: app_commands.Range[int, 
 @app_commands.check(game_channel_check)
 async def blackjack(interaction: discord.Interaction):
 	view = BlackjackView(interaction)
-	await interaction.response.send_message(f"{interaction.user.mention}'s hand: {view.hand} ({view.total()})", view=view)
+	initial_text = (
+		"🃏 Blackjack rules: draw cards to reach 21 without going over. "
+		"Hit for another card, or Stand to keep your total. The dealer must hit until 17."
+	)
+	await interaction.response.send_message(f"{initial_text}\n\n{interaction.user.mention}\n{view.describe_state()}", view=view)
 
 
 @bot.tree.command(name="unscramble", description="Solve a scrambled word")
