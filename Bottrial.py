@@ -81,6 +81,8 @@ XP_PER_MESSAGE = max(1, env_int("XP_PER_MESSAGE") or 10)
 DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ticket_bot.sqlite3")
 MEDIA_LINK_HOSTS = {"youtube.com", "youtu.be", "imgur.com", "i.imgur.com", "tenor.com", "media.tenor.com"}
 GAME_COMMANDS = {"tic-tac-toe", "rps", "roulette", "trivia", "guess", "hangman", "connect-four", "wordle", "slot", "coinflip", "roll", "blackjack", "unscramble", "emoji-quiz", "truth-or-dare", "high-low", "minefield", "pokemon-guess", "math-race", "explore"}
+HANGMAN_WORDS = ["python", "discord", "support", "diamond", "server", "ticket", "portal", "forest", "rocket", "copper"]
+WORDLE_WORDS = ["apple", "beach", "crown", "dream", "earth", "flame", "grape", "honey", "ivory", "jelly", "knight", "laser", "mango", "noble", "ocean", "pearl", "queen", "raven", "stone", "torch", "unity", "vivid", "whale", "xenon", "yacht", "zebra"]
 ANTINUKE_MODULES = ("channel_delete", "role_delete", "channel_update", "role_update", "guild_update", "member_ban", "member_kick")
 ANTI_NUKE_LOCKDOWNS: set[int] = set()
 
@@ -258,6 +260,22 @@ def ticket_name(user: discord.abc.User, category: str):
 	return f"ticket-{username}-{category}"
 
 
+def format_hangman_state(word: str, guessed: set[str]) -> str:
+	return " ".join(letter if letter in guessed else "_" for letter in word)
+
+
+def format_wordle_feedback(secret: str, guess: str) -> str:
+	feedback = []
+	for index, letter in enumerate(guess):
+		if letter == secret[index]:
+			feedback.append("🟩")
+		elif letter in secret:
+			feedback.append("🟨")
+		else:
+			feedback.append("⬜")
+	return " ".join(feedback)
+
+
 class TicketModal(discord.ui.Modal):
 	def __init__(self, category):
 		super().__init__(title=f"{CATEGORIES[category][0]} details", timeout=300)
@@ -304,13 +322,20 @@ async def create_ticket(interaction, category, minecraft_ign, details, links):
 	try:
 		channel = await guild.create_text_channel(ticket_name(interaction.user, category), category=category_channel if isinstance(category_channel, discord.CategoryChannel) else None, overwrites=overwrites, reason="Ticket created")
 		db("INSERT INTO tickets(guild_id, user_id, category, channel_id, created_at) VALUES (?, ?, ?, ?, ?)", (guild.id, interaction.user.id, category, channel.id, datetime.now(timezone.utc).isoformat())) # type: ignore
-		embed = discord.Embed(title=f"{CATEGORIES[category][0]} ticket", color=discord.Color.green())
+		embed = discord.Embed(
+			title=f"🎫 {CATEGORIES[category][0]}",
+			description="A staff member will review this ticket soon. Please keep this thread focused on the issue below.",
+			color=discord.Color.blurple(),
+		)
+		embed.add_field(name="Opened by", value=interaction.user.mention, inline=True)
+		embed.add_field(name="Category", value=CATEGORIES[category][0], inline=True)
 		embed.add_field(name="Minecraft IGN", value=minecraft_ign or "Not provided", inline=True)
-		embed.add_field(name="Details", value=details, inline=False)
+		embed.add_field(name="Details", value=details[:1024] if len(details) > 1024 else details, inline=False)
 		if links:
-			embed.add_field(name="Proof / links", value=links, inline=False)
+			embed.add_field(name="Proof / Links", value=links[:1024] if len(links) > 1024 else links, inline=False)
+		embed.set_footer(text="Use the buttons below to claim or close this ticket once it is resolved.")
 		await channel.send(f"{interaction.user.mention} {f'<@&{SUPPORT_ROLE_ID}>' if SUPPORT_ROLE_ID else ''}", embed=embed, view=CloseTicketView()) # type: ignore
-		await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True) # type: ignore
+		await interaction.followup.send(embed=discord.Embed(title="✅ Ticket created", description=f"Your ticket is ready in {channel.mention}.", color=discord.Color.green()), ephemeral=True) # type: ignore
 	except (discord.HTTPException, sqlite3.Error):
 		if channel:
 			await channel.delete(reason="Ticket setup failed")
@@ -1993,8 +2018,39 @@ async def guess(interaction: discord.Interaction):
 @bot.tree.command(name="hangman", description="Start a hangman word game")
 @app_commands.check(game_channel_check)
 async def hangman(interaction: discord.Interaction):
-	word = random.choice(["python", "discord", "support", "diamond"])
-	await interaction.response.send_message(f"Hangman: {' '.join('_' for _ in word)} | 6 lives. Guess letters in chat.")
+	word = random.choice(HANGMAN_WORDS)
+	guessed: set[str] = set()
+	lives = 6
+	message = await interaction.response.send_message(embed=discord.Embed(title="🎯 Hangman", description=f"**Word:** {format_hangman_state(word, guessed)}\n**Lives left:** {lives}\n**Guessed:** none", color=discord.Color.blurple()))
+
+	while lives > 0:
+		if not interaction.channel:
+			return
+		channel_id = interaction.channel.id
+		try:
+			incoming = await bot.wait_for("message", timeout=60, check=lambda item: bool(item.channel and item.channel.id == channel_id and not item.author.bot and item.content and item.content.lower().strip().isalpha() and len(item.content.strip()) == 1))
+		except asyncio.TimeoutError:
+			await interaction.followup.send(f"⏰ Hangman timed out. The word was **{word.upper()}**.")
+			return
+
+		guess = incoming.content.lower().strip()
+		if guess in guessed:
+			await incoming.reply("That letter was already guessed. Try another one.", delete_after=3)
+			continue
+		guessed.add(guess)
+		if guess in word:
+			masked = format_hangman_state(word, guessed)
+			if "_" not in masked:
+				await interaction.followup.send(f"🏆 {incoming.author.mention} solved the word **{word.upper()}** and won the game!")
+				return
+			await interaction.followup.send(embed=discord.Embed(title="🎯 Hangman", description=f"**Word:** {masked}\n**Lives left:** {lives}\n**Guessed:** {', '.join(sorted(guessed))}", color=discord.Color.green()))
+		else:
+			lives -= 1
+			masked = format_hangman_state(word, guessed)
+			if lives == 0:
+				await interaction.followup.send(f"💥 {incoming.author.mention} ran out of lives. The word was **{word.upper()}**.")
+				return
+			await interaction.followup.send(embed=discord.Embed(title="🎯 Hangman", description=f"**Word:** {masked}\n**Lives left:** {lives}\n**Guessed:** {', '.join(sorted(guessed))}", color=discord.Color.orange()))
 
 
 @bot.tree.command(name="connect-four", description="Play Connect Four on a 5x5 board")
@@ -2009,7 +2065,30 @@ async def connect_four(interaction: discord.Interaction, opponent: Optional[disc
 @bot.tree.command(name="wordle", description="Play a five-letter Wordle round")
 @app_commands.check(game_channel_check)
 async def wordle(interaction: discord.Interaction):
-	await interaction.response.send_message("Wordle started. Guess a five-letter word in chat within six attempts.")
+	word = random.choice(WORDLE_WORDS)
+	attempts = 0
+	await interaction.response.send_message(embed=discord.Embed(title="🟩 Wordle", description="Guess a five-letter word in chat. You have six tries.", color=discord.Color.blue()))
+
+	while attempts < 6:
+		if not interaction.channel:
+			return
+		channel_id = interaction.channel.id
+		try:
+			incoming = await bot.wait_for("message", timeout=60, check=lambda item: bool(item.channel and item.channel.id == channel_id and not item.author.bot and item.content and item.content.lower().strip().isalpha() and len(item.content.strip()) == 5))
+		except asyncio.TimeoutError:
+			await interaction.followup.send(f"⏰ Wordle timed out. The word was **{word.upper()}**.")
+			return
+
+		guess = incoming.content.lower().strip()
+		attempts += 1
+		feedback = format_wordle_feedback(word, guess)
+		await interaction.followup.send(f"{incoming.author.mention} guess {attempts}/6: **{guess.upper()}**\n{feedback}")
+		if guess == word:
+			await interaction.followup.send(f"🏆 {incoming.author.mention} solved the Wordle! The word was **{word.upper()}**.")
+			return
+		if attempts == 6:
+			await interaction.followup.send(f"❌ The Wordle is over. The word was **{word.upper()}**.")
+			return
 
 
 @bot.tree.command(name="slot", description="Spin the coin slots")
