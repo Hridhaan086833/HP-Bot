@@ -1,6 +1,6 @@
 # Discord Bot (Bottrial.py)
 
-A feature-rich, multi-functional Discord bot written in Python using `discord.py`. It includes ticket management, moderation, anti-nuke server security, text-to-speech (TTS) voice playback, AI integration via Google Gemini, minigames, economy & leveling, community utility features, and real-time health metrics.
+A feature-rich, multi-functional Discord bot written in Python using `discord.py`. It includes ticket management, moderation, anti-nuke server security, AI integration via Google Gemini, minigames, economy & leveling, community utility features, and real-time health metrics.
 
 ---
 
