@@ -70,7 +70,6 @@ SUGGESTION_CHANNEL_ID = env_int("SUGGESTION_CHANNEL_ID")
 CONFESSION_REVIEW_CHANNEL_ID = env_int("CONFESSION_REVIEW_CHANNEL_ID")
 CONFESSION_CHANNEL_ID = env_int("CONFESSION_CHANNEL_ID")
 COUNTING_CHANNEL_ID = env_int("COUNTING_CHANNEL_ID")
-VOICE_HUB_CHANNEL_ID = env_int("VOICE_HUB_CHANNEL_ID")
 MEDIA_CHANNEL_IDS = {env_int(value) for value in os.getenv("MEDIA_CHANNEL_IDS", "").split(",") if value.strip().isdigit()}
 SAFE_DOMAINS = {value.strip().lower() for value in os.getenv("SAFE_DOMAINS", "").split(",") if value.strip()}
 BLOCKED_DOMAINS = {value.strip().lower() for value in os.getenv("BLOCKED_DOMAINS", "").split(",") if value.strip()}
@@ -78,6 +77,7 @@ GOOGLE_SAFE_BROWSING_KEY = os.getenv("GOOGLE_SAFE_BROWSING_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 AI_MODEL = os.getenv("AI_MODEL", "gemini-3.6-flash")
 XP_PER_MESSAGE = max(1, env_int("XP_PER_MESSAGE") or 10)
+WELCOME_BANNER_URL = os.getenv("WELCOME_BANNER_URL", "https://images.unsplash.com/photo-1511497584788-876760111969?auto=format&fit=crop&w=1200&q=80")
 DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ticket_bot.sqlite3")
 MEDIA_LINK_HOSTS = {"youtube.com", "youtu.be", "imgur.com", "i.imgur.com", "tenor.com", "media.tenor.com"}
 GAME_COMMANDS = {"tic-tac-toe", "rps", "roulette", "trivia", "guess", "hangman", "connect-four", "wordle", "slot", "coinflip", "roll", "blackjack", "unscramble", "emoji-quiz", "truth-or-dare", "high-low", "minefield", "pokemon-guess", "math-race", "explore"}
@@ -164,10 +164,9 @@ def init_db():
 	db("CREATE TABLE IF NOT EXISTS member_xp (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, xp INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(guild_id, user_id))")
 	db("CREATE TABLE IF NOT EXISTS counting (guild_id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL, last_number INTEGER NOT NULL DEFAULT 0, last_user_id INTEGER)")
 	db("CREATE TABLE IF NOT EXISTS confessions (message_id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL, content TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending')")
-	db("CREATE TABLE IF NOT EXISTS temporary_voice (channel_id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL, owner_id INTEGER NOT NULL)")
 	db("CREATE TABLE IF NOT EXISTS media_only_channels (guild_id INTEGER NOT NULL, channel_id INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(guild_id, channel_id))")
 	db("CREATE TABLE IF NOT EXISTS media_link_roles (guild_id INTEGER PRIMARY KEY, role_id INTEGER NOT NULL)")
-	db("CREATE TABLE IF NOT EXISTS welcome_config (guild_id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL, message TEXT NOT NULL DEFAULT 'Welcome {user} to {server}!')")
+	db("CREATE TABLE IF NOT EXISTS welcome_config (guild_id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL, message TEXT NOT NULL DEFAULT 'Welcome {user} to {server}! We hope you enjoy your time here.')")
 	if not db("SELECT name FROM items", fetch=True):
 		db("INSERT INTO items VALUES (?, ?, ?)", [
 			("VIP", 500, "VIP server role"),
@@ -1113,6 +1112,8 @@ async def mediaonly(interaction: discord.Interaction, channel: discord.TextChann
 	await interaction.response.send_message(f"Media-only mode {status}d for {channel.mention}.", ephemeral=True)
 
 
+
+
 class SuggestionCommandModal(discord.ui.Modal, title="New suggestion"):
 	def __init__(self, channel: Optional[discord.TextChannel] = None):
 		super().__init__()
@@ -1520,6 +1521,14 @@ def configured_media_role(guild: discord.Guild):
 	return guild.get_role(row[0][0]) if row else None
 
 
+def get_welcome_config(guild_id: int):
+	row = db("SELECT channel_id, message FROM welcome_config WHERE guild_id=?", (guild_id,), True)
+	if not row:
+		return None
+	channel_id, message = row[0]
+	return {"channel_id": channel_id, "message": message}
+
+
 def has_unauthorized_media_link(message):
 	if message.attachments:
 		return False
@@ -1563,89 +1572,60 @@ async def media_role(interaction: discord.Interaction, role: discord.Role):
 	await interaction.response.send_message(f"Only members with {role.mention} can now post GIF, video, and photo links.", ephemeral=True)
 
 
-role_group = app_commands.Group(name="role", description="Add or remove roles for a member")
+@bot.tree.command(name="setup-welcome", description="Set the welcome channel and greeting message for new members")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(channel="Channel where welcome messages will be sent", message="Custom welcome message with {user}, {username}, {server}, and {member_count}")
+async def setup_welcome(interaction: discord.Interaction, channel: discord.TextChannel, message: str = "Welcome {user} to {server}! We hope you enjoy your time here."):
+	if interaction.guild is None:
+		return await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+	if not channel.permissions_for(interaction.guild.me).send_messages or not channel.permissions_for(interaction.guild.me).embed_links:
+		return await interaction.response.send_message("I need Send Messages and Embed Links permission in that channel.", ephemeral=True)
+	if not message.strip():
+		return await interaction.response.send_message("Please provide a valid welcome message.", ephemeral=True)
+	db("INSERT INTO welcome_config(guild_id, channel_id, message) VALUES (?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id, message=excluded.message", (interaction.guild.id, channel.id, message.strip()))
+	await interaction.response.send_message(f"Welcome channel set to {channel.mention}. New members will be greeted there.", ephemeral=True)
+
+
+role_group = app_commands.Group(name="role", description="Manage roles for members")
 bot.tree.add_command(role_group)
 
 
-@role_group.command(name="add", description="Add a role to a member")
+@role_group.command(name="add", description="Give a role to a user")
 @app_commands.checks.has_permissions(manage_roles=True)
-@app_commands.describe(member="Member to receive the role", role="Role to add")
-async def role_add(interaction: discord.Interaction, member: discord.Member, role: discord.Role):
+@app_commands.describe(role="The role to assign", user="User to give the role to")
+async def role_add(interaction: discord.Interaction, role: discord.Role, user: discord.Member):
 	if interaction.guild is None or interaction.guild.me is None:
 		return await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
 	if role.is_default():
-		return await interaction.response.send_message("Choose a role other than @everyone.", ephemeral=True)
-	if role >= interaction.guild.me.top_role or member == interaction.guild.me:
-		return await interaction.response.send_message("I cannot manage that role or member because of role hierarchy.", ephemeral=True)
-	if role in member.roles:
-		return await interaction.response.send_message(f"{member.mention} already has {role.mention}.", ephemeral=True)
+		return await interaction.response.send_message("Cannot assign the @everyone role.", ephemeral=True)
+	if role >= interaction.guild.me.top_role or user == interaction.guild.me:
+		return await interaction.response.send_message("I cannot manage that role or user because of role hierarchy.", ephemeral=True)
+	if role in user.roles:
+		return await interaction.response.send_message(f"{user.mention} already has {role.mention}.", ephemeral=True)
 	try:
-		await member.add_roles(role, reason=f"Role added by {interaction.user}")
+		await user.add_roles(role, reason=f"Role granted by {interaction.user}")
 	except discord.Forbidden:
-		return await interaction.response.send_message("I need Manage Roles permission and a higher role hierarchy to add that role.", ephemeral=True)
-	await interaction.response.send_message(f"Added {role.mention} to {member.mention}.", ephemeral=True)
+		return await interaction.response.send_message("I need Manage Roles permission and a role hierarchy above the role.", ephemeral=True)
+	await interaction.response.send_message(f"Added {role.mention} to {user.mention}.", ephemeral=True)
 
 
-@role_group.command(name="remove", description="Remove a role from a member")
+@role_group.command(name="remove", description="Remove a role from a user")
 @app_commands.checks.has_permissions(manage_roles=True)
-@app_commands.describe(member="Member to remove the role from", role="Role to remove")
-async def role_remove(interaction: discord.Interaction, member: discord.Member, role: discord.Role):
+@app_commands.describe(role="The role to remove", user="User to remove the role from")
+async def role_remove(interaction: discord.Interaction, role: discord.Role, user: discord.Member):
 	if interaction.guild is None or interaction.guild.me is None:
 		return await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
 	if role.is_default():
-		return await interaction.response.send_message("Choose a role other than @everyone.", ephemeral=True)
-	if role >= interaction.guild.me.top_role or member == interaction.guild.me:
-		return await interaction.response.send_message("I cannot manage that role or member because of role hierarchy.", ephemeral=True)
-	if role not in member.roles:
-		return await interaction.response.send_message(f"{member.mention} does not have {role.mention}.", ephemeral=True)
+		return await interaction.response.send_message("Cannot remove the @everyone role.", ephemeral=True)
+	if role >= interaction.guild.me.top_role or user == interaction.guild.me:
+		return await interaction.response.send_message("I cannot manage that role or user because of role hierarchy.", ephemeral=True)
+	if role not in user.roles:
+		return await interaction.response.send_message(f"{user.mention} does not have {role.mention}.", ephemeral=True)
 	try:
-		await member.remove_roles(role, reason=f"Role removed by {interaction.user}")
+		await user.remove_roles(role, reason=f"Role removed by {interaction.user}")
 	except discord.Forbidden:
-		return await interaction.response.send_message("I need Manage Roles permission and a higher role hierarchy to remove that role.", ephemeral=True)
-	await interaction.response.send_message(f"Removed {role.mention} from {member.mention}.", ephemeral=True)
-
-
-@role_group.command(name="choice", description="Add or remove any selected role from a member")
-@app_commands.checks.has_permissions(manage_roles=True)
-@app_commands.describe(member="Member to update", action="Choose whether to add or remove the role", role="Role to add or remove")
-async def role_choice(interaction: discord.Interaction, member: discord.Member, action: Literal["add", "remove"], role: discord.Role):
-	if action == "add":
-		return await role_add.callback(interaction, member, role)
-	return await role_remove.callback(interaction, member, role)
-
-
-@bot.tree.command(name="setup-welcome-channel", description="Set the channel where welcome messages are posted")
-@app_commands.checks.has_permissions(administrator=True)
-@app_commands.describe(channel="Text channel for join welcome messages")
-async def setup_welcome_channel(interaction: discord.Interaction, channel: discord.TextChannel):
-	if interaction.guild is None:
-		return await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
-	db("INSERT INTO welcome_config(guild_id, channel_id, message) VALUES (?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id, message=excluded.message", (interaction.guild.id, channel.id, "Welcome {user} to {server}! We are glad you are here!"))
-	await interaction.response.send_message(f"Welcome messages are now sent to {channel.mention}.", ephemeral=True)
-
-
-async def create_voice_room(member):
-	hub = member.guild.get_channel(VOICE_HUB_CHANNEL_ID)
-	if not isinstance(hub, discord.VoiceChannel):
-		return
-	overwrites = {member.guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False), member: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True, manage_channels=True)}
-	if SUPPORT_ROLE_ID and (role := member.guild.get_role(SUPPORT_ROLE_ID)):
-		overwrites[role] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
-	channel = await member.guild.create_voice_channel(f"{member.display_name}'s room", category=hub.category, overwrites=overwrites, reason="Join-to-create room")
-	db("INSERT INTO temporary_voice VALUES (?, ?, ?)", (channel.id, member.guild.id, member.id))
-	await member.move_to(channel)
-
-
-async def remove_empty_voice(channel):
-	if not isinstance(channel, discord.VoiceChannel) or channel.members:
-		return
-	row = db("SELECT channel_id FROM temporary_voice WHERE channel_id=?", (channel.id,), True)
-	if row:
-		db("DELETE FROM temporary_voice WHERE channel_id=?", (channel.id,))
-		try:
-			await channel.delete(reason="Temporary voice room empty")
-		except discord.NotFound:
-			pass
+		return await interaction.response.send_message("I need Manage Roles permission and a role hierarchy above the role.", ephemeral=True)
+	await interaction.response.send_message(f"Removed {role.mention} from {user.mention}.", ephemeral=True)
 
 
 class TicTacToeView(discord.ui.View):
@@ -2396,27 +2376,6 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
 
 
 @bot.event
-async def on_member_join(member: discord.Member):
-	if member.guild is None:
-		return
-	row = db("SELECT channel_id, message FROM welcome_config WHERE guild_id=?", (member.guild.id,), True)
-	if not row:
-		return
-	channel_id, message = row[0]
-	channel = member.guild.get_channel(channel_id)
-	if not isinstance(channel, discord.TextChannel):
-		return
-	welcome_text = (message or "Welcome {user} to {server}! We are glad you are here!").format(user=member.mention, server=member.guild.name)
-	avatar_url = member.display_avatar.url if member.display_avatar else member.default_avatar.url
-	embed = discord.Embed(title="Welcome!", description=welcome_text, color=discord.Color.blurple())
-	embed.set_thumbnail(url=avatar_url)
-	embed.add_field(name="Member", value=f"{member.mention} ({member.name})", inline=True)
-	embed.add_field(name="Account created", value=member.created_at.strftime("%Y-%m-%d"), inline=True)
-	embed.set_footer(text=f"Member #{member.guild.member_count}")
-	await channel.send(embed=embed)
-
-
-@bot.event
 async def on_member_remove(member: discord.Member):
 	await antinuke_guard_event(member.guild, "member_kick", member.id)
 
@@ -2427,15 +2386,11 @@ async def on_message_delete(message: discord.Message):
 
 
 @bot.event
-async def on_message(message: discord.Message):
-	"""Handle link scanning, media enforcement, and counting game."""
+async def on_message(message):
 	if message.author.bot or not message.guild:
-		await bot.process_commands(message)
-		return
-
+		return await bot.process_commands(message)
 	if await scan_message_links(message):
 		return
-
 	if has_unauthorized_media_link(message):
 		await record_deleted_message(message, "Media link requires configured role")
 		await message.delete()
@@ -2444,13 +2399,11 @@ async def on_message(message: discord.Message):
 		except discord.HTTPException:
 			pass
 		return
-
 	if media_only_enabled(message.guild.id, message.channel.id) and not has_media(message):
 		await record_deleted_message(message, "Media-only channel")
 		await message.delete()
 		await warn_media_only(message)
 		return
-
 	if COUNTING_CHANNEL_ID and message.channel.id == COUNTING_CHANNEL_ID:
 		row = db("SELECT last_number, last_user_id FROM counting WHERE guild_id=?", (message.guild.id,), True)
 		last_number, last_user = row[0] if row else (0, None)
@@ -2460,27 +2413,47 @@ async def on_message(message: discord.Message):
 			await message.delete()
 			return
 		db("INSERT INTO counting(guild_id, channel_id, last_number, last_user_id) VALUES (?, ?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id, last_number=excluded.last_number, last_user_id=excluded.last_user_id", (message.guild.id, message.channel.id, value, message.author.id))
-
 	await award_xp(message.author)
 	await bot.process_commands(message)
 
 
 @bot.event
-async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-	"""Handle Voice Hub room creation."""
-	if not member.guild:
+async def on_member_join(member: discord.Member):
+	config = get_welcome_config(member.guild.id)
+	if not config:
 		return
-	if member.bot:
+	channel = member.guild.get_channel(config["channel_id"])
+	if not isinstance(channel, discord.TextChannel):
 		return
-	if after.channel and after.channel.id == VOICE_HUB_CHANNEL_ID:
-		try:
-			await create_voice_room(member)
-		except discord.HTTPException as error:
-			print(f"Voice room creation failed: {error!r}")
-	if before.channel and before.channel.id != VOICE_HUB_CHANNEL_ID:
-		await remove_empty_voice(before.channel)
-	if before.channel != after.channel:
-		await award_xp(member, 2)
+	message = config["message"].format(
+		user=member.mention,
+		tusername=member.name,
+		username=member.name,
+		server=member.guild.name,
+		member_count=member.guild.member_count,
+	)
+	custom_message = message
+	if len(custom_message) > 180:
+		custom_message = custom_message[:177].rstrip() + "..."
+	accent = 0x7C5CFF
+	embed = discord.Embed(
+		title=f"✨ Welcome to {member.guild.name}!",
+		description=f"{custom_message}\n\n**Member #{member.guild.member_count}** has joined the community.",
+		color=discord.Color(accent),
+		timestamp=datetime.now(timezone.utc),
+	)
+	embed.set_author(name="New arrival", icon_url=member.display_avatar.url)
+	embed.set_thumbnail(url=member.display_avatar.url)
+	embed.set_image(url=WELCOME_BANNER_URL)
+	embed.add_field(name="Status", value="🎉 Ready to start the adventure!", inline=True)
+	embed.add_field(name="Role", value="Member", inline=True)
+	embed.add_field(name="Server", value=member.guild.name, inline=True)
+	embed.set_footer(text=f"{member.name} joined the server • {datetime.now(timezone.utc).strftime('%b %d, %Y')}", icon_url=member.display_avatar.url)
+	embed.colour = discord.Color(accent)
+	try:
+		await channel.send(embed=embed)
+	except discord.HTTPException:
+		pass
 
 
 @bot.event
