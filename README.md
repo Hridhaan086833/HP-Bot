@@ -15,7 +15,6 @@ A feature-rich, multi-functional Discord bot written in Python using `discord.py
   - [Support Tickets](#support-tickets)
   - [Anti-Nuke Protection](#anti-nuke-protection)
   - [Moderation](#moderation)
-  - [Text-to-Speech (TTS)](#text-to-speech-tts)
   - [Economy & XP Leveling](#economy--xp-leveling)
   - [Minigames](#minigames)
   - [Community & Utilities](#community--utilities)
@@ -30,7 +29,6 @@ A feature-rich, multi-functional Discord bot written in Python using `discord.py
 - **🎫 Support Ticket System**: Categorized support tickets with interactive modals, claiming system for staff, and transcript logging.
 - **🛡️ Anti-Nuke Security**: Rate-limited action detection for channel/role deletions, updates, kicks, and bans with automatic quarantine, kick, or ban responses and server lockdown.
 - **🔨 Moderation Tools**: Kick, ban, unban, mute (timeout), deleted message archiving, and automated server audit checks.
-- **🗣️ Text-to-Speech (TTS)**: Voice channel reading of member messages using `gTTS` with language, emoji skipping, and character repeat settings.
 - **🤖 Gemini AI Integration**: Ask questions and receive responses powered by Google's Gemini models.
 - **🎮 Minigames & Economy**:
   - Games: Tic-Tac-Toe, Connect Four (5x5), Rock Paper Scissors, Blackjack, Minefield, Wordle, Hangman, Trivia, Coin Slots, Coinflip, Roulette, Pokemon Guess, Math Race, Unscramble, Emoji Quiz, Dungeon Explorer, and High-Low.
