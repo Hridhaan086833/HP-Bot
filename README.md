@@ -170,17 +170,6 @@ Admin commands to control server anti-nuke safeguards (`/antinuke <subcommand>`)
 | `/deleted-logs` | Slash | Views recent deleted messages log. |
 | `/audit` | Slash | Audits server roles and unverified bots for common risk factors. |
 
-### Text-to-Speech (TTS)
-
-| Command | Type | Description |
-|---|---|---|
-| `/tts` | Slash | Joins user's voice channel and begins reading messages from members with specified role. |
-| `/tts-set` | Slash | Configures language (`en`, `es`, `fr`, `de`, `it`, `pt`, `ja`, `ko`), emoji skipping, character repetition filter, and bot message ignoring. |
-| `/tts-status` | Slash | Views active TTS voice channel status and settings. |
-| `/tts-leave` | Slash | Stops TTS and disconnects bot from voice. |
-| `-tts @role` | Prefix | Prefix command to start TTS. |
-| `-tts-leave` | Prefix | Prefix command to stop TTS and disconnect bot. |
-
 ### Economy & XP Leveling
 
 | Command | Type | Description |
