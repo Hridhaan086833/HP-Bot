@@ -41,10 +41,6 @@ A feature-rich, multi-functional Discord bot written in Python using `discord.py
 ## Prerequisites
 
 - **Python**: 3.8 or higher
-- **FFmpeg**: Required for Text-to-Speech (TTS) audio streaming in voice channels.
-  - **Linux (Ubuntu/Debian)**: `sudo apt install ffmpeg`
-  - **macOS**: `brew install ffmpeg`
-  - **Windows**: Install FFmpeg via [ffmpeg.org](https://ffmpeg.org/) or `winget install FFmpeg` and ensure it is added to system `PATH`.
 
 ---
 
@@ -60,7 +56,7 @@ A feature-rich, multi-functional Discord bot written in Python using `discord.py
    ```bash
    pip install -r requirements.txt
    ```
-   *(Optional packages used if available: `psutil` for enhanced system health metrics, `gTTS` for TTS support, `aiohttp` for Google Safe Browsing URL scanning).*
+   *(Optional packages used if available: `psutil` for enhanced system health metrics, `aiohttp` for Google Safe Browsing URL scanning).*
 
 3. **Configure Environment Variables**:
    Create a `.env` file in the root directory (see [Environment Configuration](#environment-configuration-env)).
@@ -120,7 +116,6 @@ The bot uses an automated **SQLite3** database (`ticket_bot.sqlite3`) created on
 - Counting game channel state
 - Media-only channels and media link permissions
 - Temporary voice channels
-- TTS settings and configurations
 
 ---
 
@@ -218,7 +213,8 @@ Games comply with server game channel restrictions when configured via `/setup-g
 | `/setup-reaction-roles` | Slash | Displays reaction role selection dropdown menu. |
 | `/mediaonly` | Slash | Toggles media-only requirement for a channel. |
 | `/media-role` | Slash | Selects required role to post photo, GIF, and video links. |
-| `/role add` | Slash | Grants media link permission role to a member. |
+| `/role add` | Slash | Assigns a specified role to a member (`role:<role> member:<member>`). |
+| `/role remove` | Slash | Removes a specified role from a member (`role:<role> member:<member>`). |
 
 ### AI Assistant
 
