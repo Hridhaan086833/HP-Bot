@@ -213,7 +213,8 @@ Games comply with server game channel restrictions when configured via `/setup-g
 | `/setup-reaction-roles` | Slash | Displays reaction role selection dropdown menu. |
 | `/mediaonly` | Slash | Toggles media-only requirement for a channel. |
 | `/media-role` | Slash | Selects required role to post photo, GIF, and video links. |
-| `/role add` | Slash | Grants media link permission role to a member. |
+| `/role add` | Slash | Assigns a specified role to a member (`role:<role> member:<member>`). |
+| `/role remove` | Slash | Removes a specified role from a member (`role:<role> member:<member>`). |
 
 ### AI Assistant
 

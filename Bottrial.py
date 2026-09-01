@@ -293,7 +293,7 @@ async def play_tts_audio(voice_client: discord.VoiceClient, text: str, lang: str
 		# Skip emoji if enabled
 		if skip_emoji:
 			text = ''.join(c for c in text if not any(ord(c) >= 0x1F300 for _ in [1]))
-		
+
 		# Handle repeated characters
 		if repeated_chars:
 			# Remove consecutive duplicate characters
@@ -305,17 +305,17 @@ async def play_tts_audio(voice_client: discord.VoiceClient, text: str, lang: str
 					last_char = char
 		else:
 			clean_text = text
-		
+
 		clean_text = clean_text[:200].strip()
 		if not clean_text:
 			return False
-		
+
 		# Generate TTS with specified language
 		tts_obj = gTTS(text=clean_text, lang=lang, slow=False)
 		audio_buffer = io.BytesIO()
 		tts_obj.write_to_fp(audio_buffer)
 		audio_buffer.seek(0)
-		
+
 		audio_source = discord.FFmpegPCMAudio(audio_buffer, pipe=True)
 		if not voice_client.is_playing():
 			voice_client.play(audio_source, after=lambda e: print(f"TTS playback finished: {e}") if e else None)
@@ -1170,19 +1170,19 @@ async def tts(interaction: discord.Interaction, role: discord.Role):
 	"""Slash command to start TTS"""
 	if not gTTS:
 		return await interaction.response.send_message("Text-to-speech is not available. Install gtts: `pip install gtts`", ephemeral=True)
-	
+
 	if not isinstance(interaction.user, discord.Member) or not interaction.user.voice or not interaction.user.voice.channel:
 		return await interaction.response.send_message("You must be in a voice channel to use this command.", ephemeral=True)
-	
+
 	if interaction.guild is None:
 		return await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
-	
+
 	voice_channel = interaction.user.voice.channel
 	if not isinstance(voice_channel, discord.VoiceChannel):
 		return await interaction.response.send_message("You must be in a voice channel.", ephemeral=True)
-	
+
 	await interaction.response.defer(ephemeral=True)
-	
+
 	try:
 		voice_client = await voice_channel.connect()
 		TTS_VOICE_CLIENTS[interaction.guild.id] = voice_client
@@ -1195,9 +1195,9 @@ async def tts(interaction: discord.Interaction, role: discord.Role):
 			"repeated_chars": False,
 			"bot_ignore": True
 		}
-		db("INSERT INTO tts_config(guild_id, voice_channel_id, role_id) VALUES (?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET voice_channel_id=excluded.voice_channel_id, role_id=excluded.role_id", 
+		db("INSERT INTO tts_config(guild_id, voice_channel_id, role_id) VALUES (?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET voice_channel_id=excluded.voice_channel_id, role_id=excluded.role_id",
 		   (interaction.guild.id, voice_channel.id, role.id))
-		db("INSERT INTO tts_settings(guild_id, voice_type, skip_emoji, mode, repeated_chars, bot_ignore) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET voice_type=excluded.voice_type", 
+		db("INSERT INTO tts_settings(guild_id, voice_type, skip_emoji, mode, repeated_chars, bot_ignore) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET voice_type=excluded.voice_type",
 		   (interaction.guild.id, "en", 0, "normal", 0, 1))
 		await interaction.followup.send(f"TTS activated in {voice_channel.mention}. Messages from {role.mention} will be read. Use /tts-set to configure.", ephemeral=True)
 	except discord.ClientException as e:
@@ -1213,7 +1213,7 @@ async def tts(interaction: discord.Interaction, role: discord.Role):
 				"repeated_chars": False,
 				"bot_ignore": True
 			}
-			db("INSERT INTO tts_config(guild_id, voice_channel_id, role_id) VALUES (?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET voice_channel_id=excluded.voice_channel_id, role_id=excluded.role_id", 
+			db("INSERT INTO tts_config(guild_id, voice_channel_id, role_id) VALUES (?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET voice_channel_id=excluded.voice_channel_id, role_id=excluded.role_id",
 			   (interaction.guild.id, voice_channel.id, role.id))
 			await interaction.followup.send(f"TTS activated in {voice_channel.mention}.", ephemeral=True)
 		else:
@@ -1240,10 +1240,10 @@ async def tts_set(
 	"""Configure TTS settings"""
 	if interaction.guild is None:
 		return await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
-	
+
 	if not TTS_VOICE_CLIENTS.get(interaction.guild.id):
 		return await interaction.response.send_message("TTS is not active in this server. Start with /tts first.", ephemeral=True)
-	
+
 	try:
 		TTS_SETTINGS[interaction.guild.id].update({
 			"voice_type": voice,
@@ -1251,10 +1251,10 @@ async def tts_set(
 			"repeated_chars": repeated_chars,
 			"bot_ignore": bot_ignore
 		})
-		
-		db("INSERT INTO tts_settings(guild_id, voice_type, skip_emoji, mode, repeated_chars, bot_ignore) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET voice_type=excluded.voice_type, skip_emoji=excluded.skip_emoji, repeated_chars=excluded.repeated_chars, bot_ignore=excluded.bot_ignore", 
+
+		db("INSERT INTO tts_settings(guild_id, voice_type, skip_emoji, mode, repeated_chars, bot_ignore) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET voice_type=excluded.voice_type, skip_emoji=excluded.skip_emoji, repeated_chars=excluded.repeated_chars, bot_ignore=excluded.bot_ignore",
 		   (interaction.guild.id, voice, int(skip_emoji), "normal", int(repeated_chars), int(bot_ignore)))
-		
+
 		settings_text = f"Language: {voice}\nSkip Emoji: {skip_emoji}\nRemove Repeated Chars: {repeated_chars}\nIgnore Bots: {bot_ignore}"
 		await interaction.response.send_message(f"TTS configured:\n{settings_text}", ephemeral=True)
 	except Exception as e:
@@ -1267,15 +1267,15 @@ async def tts_status(interaction: discord.Interaction):
 	"""Show TTS status"""
 	if interaction.guild is None:
 		return await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
-	
+
 	voice_client = TTS_VOICE_CLIENTS.get(interaction.guild.id)
 	if not voice_client:
 		return await interaction.response.send_message("TTS is not active in this server.", ephemeral=True)
-	
+
 	settings = TTS_SETTINGS.get(interaction.guild.id, {})
 	role = interaction.guild.get_role(settings.get("role_id", 0))
 	channel = interaction.guild.get_channel(settings.get("voice_channel_id", 0))
-	
+
 	embed = discord.Embed(title="TTS Status", color=discord.Color.green())
 	embed.add_field(name="Status", value="Active", inline=False)
 	embed.add_field(name="Voice Channel", value=channel.mention if channel else "Unknown", inline=True)
@@ -1284,7 +1284,7 @@ async def tts_status(interaction: discord.Interaction):
 	embed.add_field(name="Skip Emoji", value=str(settings.get("skip_emoji", False)), inline=True)
 	embed.add_field(name="Remove Repeated Chars", value=str(settings.get("repeated_chars", False)), inline=True)
 	embed.add_field(name="Ignore Bots", value=str(settings.get("bot_ignore", True)), inline=True)
-	
+
 	await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -1293,11 +1293,11 @@ async def tts_leave(interaction: discord.Interaction):
 	"""Stop TTS and disconnect"""
 	if interaction.guild is None:
 		return await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
-	
+
 	voice_client = TTS_VOICE_CLIENTS.get(interaction.guild.id)
 	if not voice_client:
 		return await interaction.response.send_message("TTS is not active in this server.", ephemeral=True)
-	
+
 	try:
 		await voice_client.disconnect()
 		TTS_VOICE_CLIENTS.pop(interaction.guild.id, None)
@@ -1315,20 +1315,20 @@ async def tts_prefix(ctx, role: Optional[discord.Role] = None):
 	"""Prefix command to start TTS: -tts @role"""
 	if not gTTS:
 		return await ctx.send("Text-to-speech is not available. Install gtts: `pip install gtts`")
-	
+
 	if role is None:
 		return await ctx.send("Usage: `-tts @role`")
-	
+
 	if ctx.guild is None:
 		return await ctx.send("This command can only be used in a server.")
-	
+
 	if not ctx.author.voice or not ctx.author.voice.channel:
 		return await ctx.send("You must be in a voice channel.")
-	
+
 	voice_channel = ctx.author.voice.channel
 	if not isinstance(voice_channel, discord.VoiceChannel):
 		return await ctx.send("You must be in a voice channel.")
-	
+
 	try:
 		voice_client = await voice_channel.connect()
 		TTS_VOICE_CLIENTS[ctx.guild.id] = voice_client
@@ -1341,14 +1341,14 @@ async def tts_prefix(ctx, role: Optional[discord.Role] = None):
 			"repeated_chars": False,
 			"bot_ignore": True
 		}
-		db("INSERT INTO tts_config(guild_id, voice_channel_id, role_id) VALUES (?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET voice_channel_id=excluded.voice_channel_id, role_id=excluded.role_id", 
+		db("INSERT INTO tts_config(guild_id, voice_channel_id, role_id) VALUES (?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET voice_channel_id=excluded.voice_channel_id, role_id=excluded.role_id",
 		   (ctx.guild.id, voice_channel.id, role.id))
 		await ctx.send(f"TTS activated. Use `!tts-set` for options.")
 	except discord.ClientException:
 		voice_client = discord.utils.get(bot.voice_clients, channel=voice_channel)
 		if voice_client:
 			TTS_VOICE_CLIENTS[ctx.guild.id] = voice_client
-			db("INSERT INTO tts_config(guild_id, voice_channel_id, role_id) VALUES (?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET voice_channel_id=excluded.voice_channel_id, role_id=excluded.role_id", 
+			db("INSERT INTO tts_config(guild_id, voice_channel_id, role_id) VALUES (?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET voice_channel_id=excluded.voice_channel_id, role_id=excluded.role_id",
 			   (ctx.guild.id, voice_channel.id, role.id))
 			await ctx.send("TTS activated.")
 		else:
@@ -1363,11 +1363,11 @@ async def tts_leave_prefix(ctx):
 	"""Prefix command to stop TTS: -tts-leave"""
 	if ctx.guild is None:
 		return await ctx.send("This command can only be used in a server.")
-	
+
 	voice_client = TTS_VOICE_CLIENTS.get(ctx.guild.id)
 	if not voice_client:
 		return await ctx.send("TTS is not active in this server.")
-	
+
 	try:
 		await voice_client.disconnect()
 		TTS_VOICE_CLIENTS.pop(ctx.guild.id, None)
@@ -1386,16 +1386,16 @@ async def on_message(message: discord.Message):
 	if message.author.bot or not message.content or message.guild is None:
 		await bot.process_commands(message)
 		return
-	
+
 	# Check if TTS is active for this guild
 	tts_config = db("SELECT voice_channel_id, role_id FROM tts_config WHERE guild_id=?", (message.guild.id,), True)
 	if not tts_config:
 		await bot.process_commands(message)
 		return
-	
+
 	voice_channel_id, role_id = tts_config[0]
 	voice_client = TTS_VOICE_CLIENTS.get(message.guild.id)
-	
+
 	# Verify voice client is still connected to correct channel
 	if not voice_client or not voice_client.channel or voice_client.channel.id != voice_channel_id:
 		if not voice_client:
@@ -1403,31 +1403,31 @@ async def on_message(message: discord.Message):
 			TTS_SETTINGS.pop(message.guild.id, None)
 		await bot.process_commands(message)
 		return
-	
+
 	# Get settings
 	settings = TTS_SETTINGS.get(message.guild.id, {})
 	bot_ignore = settings.get("bot_ignore", True)
-	
+
 	# Skip if author is a bot and bot_ignore is enabled
 	if bot_ignore and message.author.bot:
 		await bot.process_commands(message)
 		return
-	
+
 	# Check required role
 	required_role = message.guild.get_role(role_id)
 	if not required_role:
 		await bot.process_commands(message)
 		return
-	
+
 	if isinstance(message.author, discord.Member) and required_role in message.author.roles:
 		# Prepare text for TTS
 		tts_text = f"{message.author.display_name} says: {message.content}"
-		
+
 		# Get TTS settings
 		voice_type = settings.get("voice_type", "en")
 		skip_emoji = settings.get("skip_emoji", False)
 		repeated_chars = settings.get("repeated_chars", False)
-		
+
 		# Play TTS audio
 		await play_tts_audio(
 			voice_client,
@@ -1436,7 +1436,7 @@ async def on_message(message: discord.Message):
 			skip_emoji=skip_emoji,
 			repeated_chars=repeated_chars
 		)
-	
+
 	await bot.process_commands(message)
 
 
@@ -1445,27 +1445,27 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 	"""Auto-disconnect bot when voice channel becomes empty."""
 	if not member.guild:
 		return
-	
+
 	# Only check if TTS is active for this guild
 	if member.guild.id not in TTS_VOICE_CLIENTS:
 		return
-	
+
 	voice_client = TTS_VOICE_CLIENTS.get(member.guild.id)
 	if not voice_client or not voice_client.channel:
 		TTS_VOICE_CLIENTS.pop(member.guild.id, None)
 		TTS_SETTINGS.pop(member.guild.id, None)
 		db("DELETE FROM tts_config WHERE guild_id=?", (member.guild.id,))
 		return
-	
+
 	channel = voice_client.channel
 	if not isinstance(channel, discord.VoiceChannel):
 		TTS_VOICE_CLIENTS.pop(member.guild.id, None)
 		TTS_SETTINGS.pop(member.guild.id, None)
 		return
-	
+
 	# Check if channel still has members (excluding bots)
 	members_in_channel = [m for m in channel.members if not m.bot]
-	
+
 	if not members_in_channel:
 		# Channel is empty, disconnect bot
 		try:
@@ -1473,7 +1473,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 			print(f"TTS auto-disconnected from {channel.name} in {member.guild.name} (empty channel)")
 		except Exception as e:
 			print(f"Error disconnecting TTS voice client: {e}")
-		
+
 		# Always clean up
 		TTS_VOICE_CLIENTS.pop(member.guild.id, None)
 		TTS_SETTINGS.pop(member.guild.id, None)
@@ -1931,28 +1931,46 @@ async def media_role(interaction: discord.Interaction, role: discord.Role):
 	await interaction.response.send_message(f"Only members with {role.mention} can now post GIF, video, and photo links.", ephemeral=True)
 
 
-role_group = app_commands.Group(name="role", description="Manage the server media-link role")
+role_group = app_commands.Group(name="role", description="Manage roles for members")
 bot.tree.add_command(role_group)
 
 
-@role_group.command(name="add", description="Give the configured media-link role to a member")
+@role_group.command(name="add", description="Give a role to a member")
 @app_commands.checks.has_permissions(manage_roles=True)
-@app_commands.describe(member="Member who should be allowed to post media links")
-async def role_add(interaction: discord.Interaction, member: discord.Member):
+@app_commands.describe(role="The role to assign", member="Member to give the role to")
+async def role_add(interaction: discord.Interaction, role: discord.Role, member: discord.Member):
 	if interaction.guild is None or interaction.guild.me is None:
 		return await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
-	role = configured_media_role(interaction.guild)
-	if role is None:
-		return await interaction.response.send_message("Configure the media role first with `/media-role @Role`.", ephemeral=True)
+	if role.is_default():
+		return await interaction.response.send_message("Cannot assign the @everyone role.", ephemeral=True)
 	if role >= interaction.guild.me.top_role or member == interaction.guild.me:
 		return await interaction.response.send_message("I cannot manage that role or member because of role hierarchy.", ephemeral=True)
 	if role in member.roles:
 		return await interaction.response.send_message(f"{member.mention} already has {role.mention}.", ephemeral=True)
 	try:
-		await member.add_roles(role, reason=f"Media role granted by {interaction.user}")
+		await member.add_roles(role, reason=f"Role granted by {interaction.user}")
 	except discord.Forbidden:
-		return await interaction.response.send_message("I need Manage Roles permission and a role hierarchy above the media role.", ephemeral=True)
-	await interaction.response.send_message(f"Added {role.mention} to {member.mention}. They can now post media links.", ephemeral=True)
+		return await interaction.response.send_message("I need Manage Roles permission and a role hierarchy above the role.", ephemeral=True)
+	await interaction.response.send_message(f"Added {role.mention} to {member.mention}.", ephemeral=True)
+
+
+@role_group.command(name="remove", description="Remove a role from a member")
+@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.describe(role="The role to remove", member="Member to remove the role from")
+async def role_remove(interaction: discord.Interaction, role: discord.Role, member: discord.Member):
+	if interaction.guild is None or interaction.guild.me is None:
+		return await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+	if role.is_default():
+		return await interaction.response.send_message("Cannot remove the @everyone role.", ephemeral=True)
+	if role >= interaction.guild.me.top_role or member == interaction.guild.me:
+		return await interaction.response.send_message("I cannot manage that role or member because of role hierarchy.", ephemeral=True)
+	if role not in member.roles:
+		return await interaction.response.send_message(f"{member.mention} does not have {role.mention}.", ephemeral=True)
+	try:
+		await member.remove_roles(role, reason=f"Role removed by {interaction.user}")
+	except discord.Forbidden:
+		return await interaction.response.send_message("I need Manage Roles permission and a role hierarchy above the role.", ephemeral=True)
+	await interaction.response.send_message(f"Removed {role.mention} from {member.mention}.", ephemeral=True)
 
 
 async def create_voice_room(member):
@@ -2357,7 +2375,7 @@ async def trivia(interaction: discord.Interaction):
 
 async def timed_guess(interaction, title, answer):
 	await interaction.response.send_message(f"{title}\nFirst correct answer wins. You have 30 seconds.")
-		
+
 	try:
 		message = await bot.wait_for("message", timeout=30, check=lambda item: item.channel.id == interaction.channel.id and not item.author.bot and item.content.lower().strip() == answer.lower())
 		change_balance(message.author.id, 20)
