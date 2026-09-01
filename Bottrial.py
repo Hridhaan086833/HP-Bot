@@ -1572,10 +1572,7 @@ async def media_role(interaction: discord.Interaction, role: discord.Role):
 	await interaction.response.send_message(f"Only members with {role.mention} can now post GIF, video, and photo links.", ephemeral=True)
 
 
-@bot.tree.command(name="setup-welcome", description="Set the welcome channel and greeting message for new members")
-@app_commands.checks.has_permissions(administrator=True)
-@app_commands.describe(channel="Channel where welcome messages will be sent", message="Custom welcome message with {user}, {username}, {server}, and {member_count}")
-async def setup_welcome(interaction: discord.Interaction, channel: discord.TextChannel, message: str = "Welcome {user} to {server}! We hope you enjoy your time here."):
+async def _set_welcome_config(interaction: discord.Interaction, channel: discord.TextChannel, message: str):
 	if interaction.guild is None:
 		return await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
 	if not channel.permissions_for(interaction.guild.me).send_messages or not channel.permissions_for(interaction.guild.me).embed_links:
@@ -1584,6 +1581,20 @@ async def setup_welcome(interaction: discord.Interaction, channel: discord.TextC
 		return await interaction.response.send_message("Please provide a valid welcome message.", ephemeral=True)
 	db("INSERT INTO welcome_config(guild_id, channel_id, message) VALUES (?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id, message=excluded.message", (interaction.guild.id, channel.id, message.strip()))
 	await interaction.response.send_message(f"Welcome channel set to {channel.mention}. New members will be greeted there.", ephemeral=True)
+
+
+@bot.tree.command(name="setup-welcome", description="Set the welcome channel and greeting message for new members")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(channel="Channel where welcome messages will be sent", message="Custom welcome message with {user}, {username}, {server}, and {member_count}")
+async def setup_welcome(interaction: discord.Interaction, channel: discord.TextChannel, message: str = "Welcome {user} to {server}! We hope you enjoy your time here."):
+	await _set_welcome_config(interaction, channel, message)
+
+
+@bot.tree.command(name="setup-welcome-channel", description="Set the welcome channel and greeting message for new members")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(channel="Channel where welcome messages will be sent", message="Custom welcome message with {user}, {username}, {server}, and {member_count}")
+async def setup_welcome_channel(interaction: discord.Interaction, channel: discord.TextChannel, message: str = "Welcome {user} to {server}! We hope you enjoy your time here."):
+	await _set_welcome_config(interaction, channel, message)
 
 
 role_group = app_commands.Group(name="role", description="Manage roles for members")

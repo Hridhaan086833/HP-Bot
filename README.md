@@ -1,6 +1,6 @@
 # Discord Bot (Bottrial.py)
 
-A feature-rich, multi-functional Discord bot written in Python using `discord.py`. It includes ticket management, moderation, anti-nuke server security, AI integration via Google Gemini, minigames, economy & leveling, community utility features, and real-time health metrics.
+A feature-rich, multi-functional Discord bot written in Python using `discord.py`. It includes ticket management, moderation, anti-nuke server security, text-to-speech (TTS) voice playback, AI integration via Google Gemini, minigames, economy & leveling, community utility features, and real-time health metrics.
 
 ---
 
@@ -15,6 +15,7 @@ A feature-rich, multi-functional Discord bot written in Python using `discord.py
   - [Support Tickets](#support-tickets)
   - [Anti-Nuke Protection](#anti-nuke-protection)
   - [Moderation](#moderation)
+  - [Text-to-Speech (TTS)](#text-to-speech-tts)
   - [Economy & XP Leveling](#economy--xp-leveling)
   - [Minigames](#minigames)
   - [Community & Utilities](#community--utilities)
@@ -29,6 +30,7 @@ A feature-rich, multi-functional Discord bot written in Python using `discord.py
 - **🎫 Support Ticket System**: Categorized support tickets with interactive modals, claiming system for staff, and transcript logging.
 - **🛡️ Anti-Nuke Security**: Rate-limited action detection for channel/role deletions, updates, kicks, and bans with automatic quarantine, kick, or ban responses and server lockdown.
 - **🔨 Moderation Tools**: Kick, ban, unban, mute (timeout), deleted message archiving, and automated server audit checks.
+- **🗣️ Text-to-Speech (TTS)**: Voice channel reading of member messages using `gTTS` with language, emoji skipping, and character repeat settings.
 - **🤖 Gemini AI Integration**: Ask questions and receive responses powered by Google's Gemini models.
 - **🎮 Minigames & Economy**:
   - Games: Tic-Tac-Toe, Connect Four (5x5), Rock Paper Scissors, Blackjack, Minefield, Wordle, Hangman, Trivia, Coin Slots, Coinflip, Roulette, Pokemon Guess, Math Race, Unscramble, Emoji Quiz, Dungeon Explorer, and High-Low.
@@ -41,6 +43,10 @@ A feature-rich, multi-functional Discord bot written in Python using `discord.py
 ## Prerequisites
 
 - **Python**: 3.8 or higher
+- **FFmpeg**: Required for Text-to-Speech (TTS) audio streaming in voice channels.
+  - **Linux (Ubuntu/Debian)**: `sudo apt install ffmpeg`
+  - **macOS**: `brew install ffmpeg`
+  - **Windows**: Install FFmpeg via [ffmpeg.org](https://ffmpeg.org/) or `winget install FFmpeg` and ensure it is added to system `PATH`.
 
 ---
 
@@ -56,7 +62,7 @@ A feature-rich, multi-functional Discord bot written in Python using `discord.py
    ```bash
    pip install -r requirements.txt
    ```
-   *(Optional packages used if available: `psutil` for enhanced system health metrics, `aiohttp` for Google Safe Browsing URL scanning).*
+   *(Optional packages used if available: `psutil` for enhanced system health metrics, `gTTS` for TTS support, `aiohttp` for Google Safe Browsing URL scanning).*
 
 3. **Configure Environment Variables**:
    Create a `.env` file in the root directory (see [Environment Configuration](#environment-configuration-env)).
@@ -116,6 +122,7 @@ The bot uses an automated **SQLite3** database (`ticket_bot.sqlite3`) created on
 - Counting game channel state
 - Media-only channels and media link permissions
 - Temporary voice channels
+- TTS settings and configurations (`tts_config`, `tts_settings`)
 
 ---
 
@@ -162,6 +169,17 @@ Admin commands to control server anti-nuke safeguards (`/antinuke <subcommand>`)
 | `/setup-deletion-logs` | Slash | Sets channel for deleted message archive logs. |
 | `/deleted-logs` | Slash | Views recent deleted messages log. |
 | `/audit` | Slash | Audits server roles and unverified bots for common risk factors. |
+
+### Text-to-Speech (TTS)
+
+| Command | Type | Description |
+|---|---|---|
+| `/tts` | Slash | Joins user's voice channel and begins reading messages from members with specified role. |
+| `/tts-set` | Slash | Configures language (`en`, `es`, `fr`, `de`, `it`, `pt`, `ja`, `ko`), emoji skipping, character repetition filter, and bot message ignoring. |
+| `/tts-status` | Slash | Views active TTS voice channel status and settings. |
+| `/tts-leave` | Slash | Stops TTS and disconnects bot from voice. |
+| `-tts @role` | Prefix | Prefix command to start TTS. |
+| `-tts-leave` | Prefix | Prefix command to stop TTS and disconnect bot. |
 
 ### Economy & XP Leveling
 
