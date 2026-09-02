@@ -1,9 +1,5 @@
 # HP Bot
 
-A feature-rich, multi-functional Discord bot written in Python using discord.py. It includes ticket management, moderation, anti-nuke server security, AI integration via Google Gemini, minigames, economy & leveling, community utility features, and real-time health metrics.
-
----
-
 ## 🌟 Overview
 
 **HP Bot** is designed to be an all-in-one Discord bot solution providing server management, enhanced security, user engagement, and interactive gaming features powered by modern `discord.py` app commands (slash commands) and interactive UI components (buttons, selects, modals).
