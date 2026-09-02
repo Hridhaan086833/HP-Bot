@@ -95,12 +95,19 @@ CATEGORIES = {
 	"vip": ("VIP Support", "Minecraft IGN and a detailed VIP-related request."),
 }
 
+try:
+	from dashboard_server import DashboardServer
+except ImportError:
+	DashboardServer = None
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 GIVEAWAY_TASKS: dict[int, asyncio.Task] = {}
 BOT_START_TIME = datetime.now(timezone.utc)
+bot.start_time = BOT_START_TIME
+DASHBOARD_INSTANCE = None
 tracemalloc.start()
 
 
@@ -750,7 +757,14 @@ def schedule_giveaway(message_id, end_at):
 
 @bot.event
 async def on_ready():
+	global DASHBOARD_INSTANCE
 	init_db()
+	if DASHBOARD_INSTANCE is None and DashboardServer is not None and os.getenv("DASHBOARD_ENABLED", "1").lower() in ("1", "true", "yes"):
+		try:
+			DASHBOARD_INSTANCE = DashboardServer(bot=bot)
+			asyncio.create_task(DASHBOARD_INSTANCE.start())
+		except Exception as err:
+			print(f"Failed to start dashboard server: {err!r}")
 	if not getattr(bot, "_persistent_views_added", False):
 		bot.add_view(TicketView())
 		bot.add_view(CloseTicketView())

@@ -1,6 +1,6 @@
 # Discord Bot (Bottrial.py)
 
-A feature-rich, multi-functional Discord bot written in Python using `discord.py`. It includes ticket management, moderation, anti-nuke server security, text-to-speech (TTS) voice playback, AI integration via Google Gemini, minigames, economy & leveling, community utility features, and real-time health metrics.
+A feature-rich, multi-functional Discord bot written in Python using `discord.py`. It includes ticket management, moderation, anti-nuke server security, text-to-speech (TTS) voice playback, AI integration via Google Gemini, minigames, economy & leveling, community utility features, real-time health metrics, and a 3D control center web dashboard.
 
 ---
 
@@ -21,6 +21,7 @@ A feature-rich, multi-functional Discord bot written in Python using `discord.py
   - [Community & Utilities](#community--utilities)
   - [AI Assistant](#ai-assistant)
   - [System Health & Info](#system-health--info)
+  - [3D Web Dashboard](#3d-web-dashboard)
 - [License](#license)
 
 ---
@@ -37,6 +38,7 @@ A feature-rich, multi-functional Discord bot written in Python using `discord.py
   - Economy: Daily rewards, coin balance, shop, item purchases, and server coin leaderboard.
   - Activity XP: XP progression and role rewards based on message activity.
 - **💡 Community Utilities**: Suggestions with upvote/downvote polling, anonymous confessions with staff review, giveaways, reaction role panel, media-only channels, and a join-to-create temporary voice hub.
+- **🌐 3D Web Dashboard**: Real-time 3D control panel built with Three.js rendering bot metrics, active support tickets, economy leaderboards, anti-nuke safeguards, and audit deletion logs.
 
 ---
 
@@ -62,7 +64,7 @@ A feature-rich, multi-functional Discord bot written in Python using `discord.py
    ```bash
    pip install -r requirements.txt
    ```
-   *(Optional packages used if available: `psutil` for enhanced system health metrics, `gTTS` for TTS support, `aiohttp` for Google Safe Browsing URL scanning).*
+   *(Optional packages used if available: `psutil` for enhanced system health metrics, `gTTS` for TTS support, `aiohttp` for Web Dashboard and Google Safe Browsing URL scanning).*
 
 3. **Configure Environment Variables**:
    Create a `.env` file in the root directory (see [Environment Configuration](#environment-configuration-env)).
@@ -105,6 +107,10 @@ AI_MODEL=gemini-3.6-flash
 XP_PER_MESSAGE=10
 REACTION_ROLES=Gamer:123456789012345678,VIP:987654321098765432
 RANK_ROLES=5:123456789012345678,10:987654321098765432
+
+# 3D Web Dashboard Configuration
+DASHBOARD_ENABLED=1
+DASHBOARD_PORT=8000
 ```
 
 ---
@@ -247,6 +253,18 @@ Games comply with server game channel restrictions when configured via `/setup-g
 | `/health` / `/status` | Slash | Inspects bot ping, event loop delay, RSS/Peak memory usage, uptime, guild/member counts, Python version, and system time. |
 | `/help` | Slash | Displays interactive command guide categorized by topic. |
 | `!health` | Prefix | Text response pointing to `/health` / `/status`. |
+
+### 3D Web Dashboard
+
+Access the live 3D web dashboard in your web browser at `http://localhost:8000` (or `http://<your-server-ip>:8000`) when the bot is running.
+
+Features include:
+- Interactive 3D WebGL background powered by **Three.js** with floating 3D objects and star particles.
+- Real-time **3D dynamic tilt cards** showing websocket latency, RAM allocation, Python peak memory, active guilds/members, and uptime.
+- Live economy top 10 leaderboard synced with `ticket_bot.sqlite3`.
+- Active support ticket status tracking and claim details.
+- Real-time Anti-Nuke status and module guard toggles.
+- Audit deletion message logs viewer.
 
 ---
 
