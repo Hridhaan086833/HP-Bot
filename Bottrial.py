@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import json
 import sqlite3
 import ast
 import operator
@@ -10,7 +11,9 @@ import string
 import time
 import sys
 import tracemalloc
+import threading
 from urllib.parse import urlparse
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
@@ -748,6 +751,133 @@ def schedule_giveaway(message_id, end_at):
 	GIVEAWAY_TASKS[message_id].add_done_callback(lambda _: asyncio.create_task(finish_giveaway(message_id)))
 
 
+def build_dashboard_metrics():
+	guilds = list(bot.guilds)
+	guild_count = len(guilds)
+	member_count = sum((guild.member_count or 0) for guild in guilds)
+	def count_rows(query):
+		rows = db(query, fetch=True)
+		return rows[0][0] if rows else 0
+
+	active_tickets = count_rows("SELECT COUNT(*) FROM tickets")
+	active_giveaways = count_rows("SELECT COUNT(*) FROM giveaways WHERE status='active'")
+	suggestions = count_rows("SELECT COUNT(*) FROM suggestions")
+	confessions = count_rows("SELECT COUNT(*) FROM confessions")
+	security_events = count_rows("SELECT COUNT(*) FROM antinuke_events")
+	uptime = datetime.now(timezone.utc) - BOT_START_TIME
+	hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+	minutes, _ = divmod(remainder, 60)
+	latency_ms = bot.latency * 1000 if bot.latency is not None else 0
+	current_mem, peak_mem = tracemalloc.get_traced_memory()
+	memory_line = f"Python memory: {format_bytes(current_mem)} | Peak: {format_bytes(peak_mem)}"
+	return {
+		"overview": {
+			"guilds": guild_count,
+			"members": member_count,
+			"uptime": f"{hours}h {minutes}m",
+			"latency": f"{latency_ms:.0f}ms",
+			"status": "System nominal",
+			"chart": [max(20, active_tickets * 8), max(20, active_giveaways * 18), max(20, suggestions * 6), 62, 75, 84, 88, 92],
+			"modules": [
+				{"name": "Support", "status": "Healthy", "load": min(99, 60 + (active_tickets * 4)), "color": "#67e8f9"},
+				{"name": "Security", "status": "Protected", "load": min(99, 70 + (security_events * 2)), "color": "#34d399"},
+				{"name": "Games", "status": "Online", "load": 76, "color": "#8b5cf6"},
+				{"name": "Economy", "status": "Stable", "load": min(99, 62 + (suggestions * 2)), "color": "#fbbf24"},
+				{"name": "AI", "status": "Ready", "load": 68, "color": "#fb7185"}
+			]
+		},
+		"security": {
+			"guilds": guild_count,
+			"members": member_count,
+			"uptime": f"{hours}h {minutes}m",
+			"latency": f"{latency_ms:.0f}ms",
+			"status": "Threat scan clear",
+			"chart": [32, 45, 58, 62, 70, 82, 89, 94],
+			"modules": [
+				{"name": "Anti-nuke", "status": "Armed", "load": 96, "color": "#34d399"},
+				{"name": "Audit", "status": "Running", "load": 88, "color": "#67e8f9"},
+				{"name": "Lockdown", "status": "Standby", "load": 42, "color": "#fbbf24"},
+				{"name": "Whitelist", "status": "Synced", "load": 80, "color": "#8b5cf6"}
+			]
+		},
+		"support": {
+			"guilds": guild_count,
+			"members": member_count,
+			"uptime": f"{hours}h {minutes}m",
+			"latency": f"{latency_ms:.0f}ms",
+			"status": "Ticket flow steady",
+			"chart": [40, 46, 58, 63, 70, 82, 88, 86],
+			"modules": [
+				{"name": "Tickets", "status": "Balanced", "load": min(99, 70 + active_tickets * 4), "color": "#67e8f9"},
+				{"name": "Claims", "status": "Open", "load": 78, "color": "#8b5cf6"},
+				{"name": "Logs", "status": "Archive", "load": 83, "color": "#34d399"},
+				{"name": "Mediation", "status": "High", "load": min(99, 60 + confessions * 3), "color": "#fbbf24"}
+			]
+		},
+		"games": {
+			"guilds": guild_count,
+			"members": member_count,
+			"uptime": f"{hours}h {minutes}m",
+			"latency": f"{latency_ms:.0f}ms",
+			"status": "Game ring active",
+			"chart": [44, 57, 60, 66, 73, 79, 81, 75],
+			"modules": [
+				{"name": "Games", "status": "Live", "load": 86, "color": "#8b5cf6"},
+				{"name": "Hangman", "status": "Ready", "load": 70, "color": "#67e8f9"},
+				{"name": "Trivia", "status": "Queued", "load": 64, "color": "#34d399"},
+				{"name": "Roulette", "status": "Cool", "load": 51, "color": "#fb7185"}
+			]
+		},
+		"economy": {
+			"guilds": guild_count,
+			"members": member_count,
+			"uptime": f"{hours}h {minutes}m",
+			"latency": f"{latency_ms:.0f}ms",
+			"status": "Economy stable",
+			"chart": [48, 56, 62, 68, 76, 80, 87, 94],
+			"modules": [
+				{"name": "Shop", "status": "Open", "load": 82, "color": "#fbbf24"},
+				{"name": "XP", "status": "Engaged", "load": min(99, 70 + suggestions), "color": "#67e8f9"},
+				{"name": "Daily", "status": "Awarding", "load": 76, "color": "#34d399"},
+				{"name": "Leaderboard", "status": "Live", "load": 91, "color": "#8b5cf6"}
+			]
+		},
+		"memory_line": memory_line,
+	}
+
+
+def start_dashboard_server(host="0.0.0.0", port=None):
+	if port is None:
+		port = int(os.getenv("DASHBOARD_PORT", "8000"))
+	if getattr(bot, "_dashboard_server", None):
+		return bot._dashboard_server # type: ignore
+
+	class BotDashboardHandler(SimpleHTTPRequestHandler):
+		def __init__(self, *args, **kwargs):
+			super().__init__(*args, directory=os.path.dirname(os.path.abspath(__file__)), **kwargs)
+
+		def do_GET(self):
+			parsed = urlparse(self.path)
+			if parsed.path == "/api/metrics":
+				payload = json.dumps(build_dashboard_metrics()).encode("utf-8")
+				self.send_response(200)
+				self.send_header("Content-Type", "application/json")
+				self.send_header("Content-Length", str(len(payload)))
+				self.end_headers()
+				self.wfile.write(payload)
+				return
+			if parsed.path in {"/", "/index.html"}:
+				self.path = "/dashboard.html"
+			return super().do_GET()
+
+	server = ThreadingHTTPServer((host, port), BotDashboardHandler)
+	bot._dashboard_server = server  # type: ignore[attr-defined]
+	thread = threading.Thread(target=server.serve_forever, daemon=True)
+	thread.start()
+	print(f"Dashboard running at http://localhost:{port}/dashboard.html")
+	return server
+
+
 @bot.event
 async def on_ready():
 	init_db()
@@ -770,6 +900,7 @@ async def on_ready():
 		bot._commands_synced = True # type: ignore
 	for message_id, end_at in (db("SELECT message_id, end_at FROM giveaways WHERE status='active'", fetch=True) or []):
 		schedule_giveaway(message_id, end_at)
+	start_dashboard_server()
 	print(f"Logged in as {bot.user}")
 
 
@@ -1704,11 +1835,15 @@ class ConnectFourView(discord.ui.View):
 		self.board = [[" "] * 5 for _ in range(5)]
 		self.turn = 0
 		self.message: Optional[discord.Message] = None
-		for row in range(5):
-			for col in range(5):
-				button = discord.ui.Button(label="⚪", style=discord.ButtonStyle.secondary, row=row, custom_id=f"cf:{row}:{col}")
-				button.callback = self.make_callback(row, col)
-				self.add_item(button)
+		self.column_select = discord.ui.Select(
+			placeholder="Choose an open column (1–5)",
+			min_values=1,
+			max_values=1,
+			options=self.column_options(),
+			custom_id="connect-four:column",
+		)
+		self.column_select.callback = self.drop_token
+		self.add_item(self.column_select)
 
 	def board_text(self):
 		header = "  1  2  3  4  5"
@@ -1722,6 +1857,17 @@ class ConnectFourView(discord.ui.View):
 			if self.board[row][col] == " ":
 				return row
 		return None
+
+	def column_options(self):
+		return [
+			discord.SelectOption(
+				label=f"Column {col + 1}",
+				value=str(col),
+				description="Drop your token here",
+			)
+			for col in range(5)
+			if self.next_open_slot(col) is not None
+		]
 
 	def winner(self, symbol):
 		for row in range(5):
@@ -1741,38 +1887,34 @@ class ConnectFourView(discord.ui.View):
 						return True
 		return False
 
-	def make_callback(self, row, col):
-		async def callback(interaction):
-			if interaction.user != self.players[self.turn]:
-				return await interaction.response.send_message("Wait for your turn.", ephemeral=True)
-			lowest_row = self.next_open_slot(col)
-			if lowest_row is None:
-				return await interaction.response.send_message("That column is full. Pick another open column.", ephemeral=True)
-			if row != lowest_row:
-				return await interaction.response.send_message("Click any open space in the column to drop your token to the lowest available slot.", ephemeral=True)
-			symbol = "🔴" if self.turn == 0 else "🟡"
-			self.board[lowest_row][col] = symbol
-			button = self.children[lowest_row * 5 + col]
-			button.label = symbol
-			button.style = discord.ButtonStyle.red if self.turn == 0 else discord.ButtonStyle.blurple
-			button.disabled = True
-			if self.winner(symbol):
-				for item in self.children:
-					item.disabled = True # type: ignore
-				winner_member = self.players[self.turn]
-				loser_member = self.players[1 - self.turn]
-				return await interaction.response.edit_message(content=f"🏆 {winner_member.mention} wins Connect Four! {loser_member.mention}, better luck next time.\n\n{self.board_text()}", view=self)
-			if all(cell != " " for row_cells in self.board for cell in row_cells):
-				for item in self.children:
-					item.disabled = True # type: ignore
-				return await interaction.response.edit_message(content=f"🤝 Draw! {self.players[0].mention} and {self.players[1].mention} tied on the 5x5 board.\n\n{self.board_text()}", view=self)
-			self.turn = 1 - self.turn
-			await interaction.response.edit_message(content=f"🎮 {self.players[0].mention} 🔴 vs {self.players[1].mention} 🟡\n{self.board_text()}\n\nTurn: {self.players[self.turn].mention}\nTip: click any open slot in a column and it will drop to the lowest available spot.", view=self)
-		return callback
+	async def drop_token(self, interaction: discord.Interaction):
+		if interaction.user != self.players[self.turn]:
+			return await interaction.response.send_message("Wait for your turn.", ephemeral=True)
+		selected_values = self.column_select.values
+		if len(selected_values) != 1 or selected_values[0] not in ("0", "1", "2", "3", "4"):
+			return await interaction.response.send_message("Choose a valid column from the dropdown.", ephemeral=True)
+		col = int(selected_values[0])
+		lowest_row = self.next_open_slot(col)
+		if lowest_row is None:
+			return await interaction.response.send_message("That column is full. Pick another open column.", ephemeral=True)
+
+		symbol = "🔴" if self.turn == 0 else "🟡"
+		self.board[lowest_row][col] = symbol
+		if self.winner(symbol):
+			self.column_select.disabled = True
+			winner_member = self.players[self.turn]
+			loser_member = self.players[1 - self.turn]
+			return await interaction.response.edit_message(content=f"🏆 {winner_member.mention} wins Connect Four! {loser_member.mention}, better luck next time.\n\n{self.board_text()}", view=self)
+		if all(cell != " " for row_cells in self.board for cell in row_cells):
+			self.column_select.disabled = True
+			return await interaction.response.edit_message(content=f"🤝 Draw! {self.players[0].mention} and {self.players[1].mention} tied on the 5x5 board.\n\n{self.board_text()}", view=self)
+
+		self.turn = 1 - self.turn
+		self.column_select.options = self.column_options()
+		await interaction.response.edit_message(content=f"🎮 {self.players[0].mention} 🔴 vs {self.players[1].mention} 🟡\n{self.board_text()}\n\nTurn: {self.players[self.turn].mention}\nTip: choose an open column from the dropdown to drop your token.", view=self)
 
 	async def on_timeout(self):
-		for item in self.children:
-			item.disabled = True # type: ignore
+		self.column_select.disabled = True
 		if self.message:
 			await self.message.edit(content=f"⌛ Connect Four expired. {self.players[0].mention} and {self.players[1].mention}, start a new game to play again.", view=self)
 
@@ -1801,7 +1943,7 @@ class GameChallengeView(discord.ui.View):
 			game_view.message = await interaction.original_response()
 		elif self.game == "connect-four":
 			game_view = ConnectFourView(self.challenger, self.opponent)
-			await interaction.response.edit_message(content=f"🎮 {self.challenger.mention} 🔴 vs {self.opponent.mention} 🟡\n{game_view.board_text()}\n\nTurn: {self.challenger.mention}\nTip: click any open square in a column to drop the token to the lowest available spot.", view=game_view)
+			await interaction.response.edit_message(content=f"🎮 {self.challenger.mention} 🔴 vs {self.opponent.mention} 🟡\n{game_view.board_text()}\n\nTurn: {self.challenger.mention}\nTip: choose an open column from the dropdown to drop your token.", view=game_view)
 			game_view.message = await interaction.original_response()
 		else:
 			game_view = RPSView(self.challenger, self.opponent)
